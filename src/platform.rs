@@ -24,6 +24,15 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     path_key(a) == path_key(b)
 }
 
+/// True when `child` is `parent` or a folder inside it (docs/43 WIN-6 spelling).
+pub fn is_subpath(child: &Path, parent: &Path) -> bool {
+    let child = path_key(child);
+    let parent = path_key(parent);
+    child == parent
+        || child.starts_with(&format!("{parent}\\"))
+        || child.starts_with(&format!("{parent}/"))
+}
+
 /// The comparison key for [`same_path`] — normalized spelling, never displayed.
 /// The node keeps the user's original spelling for its label and pane cwd.
 fn path_key(p: &Path) -> String {
@@ -261,7 +270,12 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    windows::process_cwd(pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
@@ -539,6 +553,145 @@ pub fn process_tree(root: u32) -> Vec<ProcInfo> {
 #[cfg(not(any(unix, windows)))]
 pub fn process_tree(_root: u32) -> Vec<ProcInfo> {
     Vec::new()
+}
+
+/// One pane's live cwd evidence from a shared process snapshot.
+///
+/// The PTY child owns the pane cwd. A descendant git cwd is a candidate
+/// override (Pi and similar `chdir` in a child) and must be held stable by
+/// the app before it can rehome the pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneCwdEvidence {
+    pub pid: u32,
+    pub owner_cwd: Option<PathBuf>,
+    pub owner_git_root: Option<PathBuf>,
+    pub descendant_git_cwd: Option<PathBuf>,
+    pub descendant_git_root: Option<PathBuf>,
+}
+
+/// Resolve every pane root from **one** process-table snapshot. Git-root
+/// probes are cached per directory for this scan. Call off the app loop.
+pub fn scan_pane_cwds(roots: &[u32]) -> Vec<PaneCwdEvidence> {
+    let mut cache = std::collections::HashMap::new();
+    let trees = descendant_pid_trees(roots);
+    roots
+        .iter()
+        .map(|&root| {
+            let nodes = trees.get(&root).map(Vec::as_slice).unwrap_or(&[]);
+            evidence_from_tree(root, nodes, &mut cache)
+        })
+        .collect()
+}
+
+fn descendant_pid_trees(roots: &[u32]) -> std::collections::HashMap<u32, Vec<(u32, u16)>> {
+    #[cfg(unix)]
+    {
+        use std::collections::{HashMap, HashSet};
+        let Some((_, children)) = ps_table() else {
+            return HashMap::new();
+        };
+        roots
+            .iter()
+            .map(|&root| {
+                let mut out = Vec::new();
+                let mut seen = HashSet::new();
+                let mut stack = vec![(root, 0u16)];
+                while let Some((pid, depth)) = stack.pop() {
+                    if !seen.insert(pid) || out.len() >= 64 {
+                        continue;
+                    }
+                    out.push((pid, depth));
+                    if let Some(kids) = children.get(&pid) {
+                        for &k in kids.iter().rev() {
+                            stack.push((k, depth.saturating_add(1)));
+                        }
+                    }
+                }
+                (root, out)
+            })
+            .collect()
+    }
+    #[cfg(windows)]
+    {
+        windows::descendant_pid_trees(roots)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = roots;
+        std::collections::HashMap::new()
+    }
+}
+
+fn evidence_from_tree(
+    root: u32,
+    nodes: &[(u32, u16)],
+    cache: &mut std::collections::HashMap<String, Option<PathBuf>>,
+) -> PaneCwdEvidence {
+    let mut owner_cwd = None;
+    let mut best_git: Option<(u16, PathBuf, PathBuf)> = None;
+    for &(pid, depth) in nodes {
+        let Some(cwd) = process_cwd(pid).filter(|cwd| !is_system_cwd(cwd)) else {
+            continue;
+        };
+        if depth == 0 {
+            owner_cwd = Some(cwd.clone());
+        }
+        if let Some(git_root) = cached_git_root(&cwd, cache) {
+            if best_git
+                .as_ref()
+                .is_none_or(|(best_depth, _, _)| depth >= *best_depth)
+            {
+                best_git = Some((depth, cwd, git_root));
+            }
+        }
+    }
+    if owner_cwd.is_none() {
+        owner_cwd = process_cwd(root).filter(|cwd| !is_system_cwd(cwd));
+    }
+    let owner_git_root = owner_cwd
+        .as_ref()
+        .and_then(|cwd| cached_git_root(cwd, cache));
+    let (descendant_git_cwd, descendant_git_root) = match best_git {
+        Some((_, cwd, git_root)) => (Some(cwd), Some(git_root)),
+        None => (None, None),
+    };
+    PaneCwdEvidence {
+        pid: root,
+        owner_cwd,
+        owner_git_root,
+        descendant_git_cwd,
+        descendant_git_root,
+    }
+}
+
+fn cached_git_root(
+    cwd: &Path,
+    cache: &mut std::collections::HashMap<String, Option<PathBuf>>,
+) -> Option<PathBuf> {
+    let key = path_key(cwd);
+    if let Some(hit) = cache.get(&key) {
+        return hit.clone();
+    }
+    let root = git_root(cwd);
+    cache.insert(key, root.clone());
+    root
+}
+
+fn is_system_cwd(cwd: &Path) -> bool {
+    let key = path_key(cwd);
+    key == "c:\\windows"
+        || key.starts_with("c:\\windows\\")
+        || key.starts_with("c:\\program files")
+        || key.starts_with("c:\\programdata")
+}
+
+/// Nearest `.git` dir or worktree `.git` file in `cwd` or any ancestor.
+/// Filesystem probe only — no `git` subprocess — so a home folder like
+/// `C:\Users\Administrator` cannot block the UI thread on `git rev-parse`.
+pub fn git_root(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(|dir| dir.to_path_buf())
 }
 
 /// Raise the OS timer resolution so the event loop's timed waits (`recv_timeout`,
@@ -831,5 +984,57 @@ mod tests {
         }
         // An unknown keyword falls back to itself.
         assert_eq!(super::shell_label("nu"), "nu");
+    }
+
+    #[test]
+    fn git_root_walks_every_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "luvus-git-deep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut nested = root.clone();
+        for i in 0..12 {
+            nested = nested.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&nested).expect("nested dirs");
+        std::fs::create_dir_all(root.join(".git")).expect("git root");
+        let found = super::git_root(&nested).expect("uncapped ancestor walk");
+        assert!(
+            super::same_path(&found, &root),
+            "git_root={found:?} repo={root:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_root_recognizes_worktree_git_file() {
+        let root = std::env::temp_dir().join(format!(
+            "luvus-git-wt-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let gitdir = root.join("main.git");
+        let worktree = root.join("linked");
+        std::fs::create_dir_all(&gitdir).expect("gitdir");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/feat\n").expect("HEAD");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect("worktree git file");
+        let found = super::git_root(&worktree).expect("worktree .git file");
+        assert!(
+            super::same_path(&found, &worktree),
+            "git_root={found:?} worktree={worktree:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

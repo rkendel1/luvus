@@ -68,6 +68,10 @@ const QUIET_DWELL: Duration = Duration::from_millis(2500);
 /// Kept short so a genuinely working agent still lights up promptly after a resize.
 const RESIZE_GRACE: Duration = Duration::from_millis(450);
 
+/// Consecutive cwd scans a descendant git root must survive before it can
+/// override the PTY child's cwd and rehome the tab.
+const CWD_REHOME_STABLE_SCANS: u8 = 2;
+
 /// Sidebar width in columns. `sidebar_width` is adjustable at runtime and in the
 /// Settings → Layout tab; these bound it. Colors come from the `Theme`, also
 /// selectable in Settings → Theme (see docs/15).
@@ -1484,6 +1488,11 @@ pub struct App {
     pub downsample: bool,
     /// Throttle for refreshing pane working directories.
     last_cwd_at: Instant,
+    /// One cwd scan at a time, same guard as the process scan.
+    cwd_scan_inflight: bool,
+    /// Consecutive descendant-git cwd hits per pane. Rehome waits until the
+    /// same git root appears twice so a short-lived helper cannot steal the tab.
+    cwd_git_hits: HashMap<PaneId, (PathBuf, u8)>,
     /// Resumable agent sessions discovered on disk (for the AGENTS sidebar).
     pub resumable: Vec<crate::agent::SessionInfo>,
     /// A resumable-session disk scan is running on a worker thread; don't start
@@ -1909,6 +1918,8 @@ impl App {
             toast: None,
             downsample: false,
             last_cwd_at: Instant::now(),
+            cwd_scan_inflight: false,
+            cwd_git_hits: HashMap::new(),
             resumable: Vec::new(),
             sessions_scan_inflight: false,
             proc_commands: HashMap::new(),
@@ -2449,6 +2460,8 @@ impl App {
             toast: None,
             downsample: false,
             last_cwd_at: Instant::now(),
+            cwd_scan_inflight: false,
+            cwd_git_hits: HashMap::new(),
             resumable: Vec::new(),
             sessions_scan_inflight: false,
             proc_commands: HashMap::new(),
@@ -4622,34 +4635,312 @@ impl App {
     /// keying) and refresh each workspace's git branch from its **fixed** folder.
     /// A workspace is a **static workspace**: `cd`-ing inside a pane does not move the
     /// workspace's directory — only its branch updates (a checkout changes that).
+    ///
+    /// Tests call this synchronously. The live 1s path in `detect_tick` runs the
+    /// same scan on a worker and applies [`AppEvent::CwdScanned`].
+    #[cfg(test)]
     fn refresh_cwds(&mut self) {
-        let updates: Vec<(PaneId, PathBuf)> = self
+        let panes: Vec<(PaneId, u32)> = self
             .panes
             .iter()
             .filter_map(|(id, p)| {
                 let pid = p.child_pid.load(std::sync::atomic::Ordering::SeqCst);
-                (pid != 0)
-                    .then(|| crate::platform::process_cwd(pid))
-                    .flatten()
-                    .map(|c| (*id, c))
+                (pid != 0).then_some((*id, pid))
             })
             .collect();
-        for (id, cwd) in updates {
-            if let Some(p) = self.panes.get_mut(&id) {
-                p.cwd = cwd;
+        let pids: Vec<u32> = panes.iter().map(|(_, pid)| *pid).collect();
+        let evidence = crate::platform::scan_pane_cwds(&pids);
+        let pane_results = panes
+            .into_iter()
+            .zip(evidence)
+            .map(|((id, _), ev)| (id, ev))
+            .collect();
+        let branches = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.id.clone(), git_branch(&ws.cwd)))
+            .collect();
+        self.apply_cwd_scan(pane_results, branches);
+    }
+
+    /// Apply one off-loop cwd snapshot. The PTY child owns the pane cwd; a
+    /// descendant git cwd overrides only after [`CWD_REHOME_STABLE_SCANS`].
+    fn apply_cwd_scan(
+        &mut self,
+        panes: Vec<(PaneId, crate::platform::PaneCwdEvidence)>,
+        branches: Vec<(String, Option<String>)>,
+    ) -> bool {
+        self.cwd_scan_inflight = false;
+        let live: HashSet<PaneId> = panes.iter().map(|(id, _)| *id).collect();
+        self.cwd_git_hits.retain(|id, _| live.contains(id));
+        let mut changed = false;
+        for (id, evidence) in panes {
+            let Some(chosen) = self.choose_pane_cwd(id, &evidence) else {
+                continue;
+            };
+            let Some(pane) = self.panes.get_mut(&id) else {
+                continue;
+            };
+            if !crate::platform::same_path(&pane.cwd, &chosen) {
+                pane.cwd = chosen;
+                changed = true;
             }
         }
-        let branches: Vec<(usize, Option<String>)> = self
+        for (id, branch) in branches {
+            if let Some(ws) = self.workspaces.iter_mut().find(|ws| ws.id == id) {
+                if ws.branch != branch {
+                    ws.branch = branch;
+                    changed = true;
+                }
+            }
+        }
+        let moved = self.rehome_panes_by_cwd();
+        changed || moved
+    }
+
+    fn choose_pane_cwd(
+        &mut self,
+        id: PaneId,
+        evidence: &crate::platform::PaneCwdEvidence,
+    ) -> Option<PathBuf> {
+        let descendant_differs = match (
+            evidence.descendant_git_root.as_ref(),
+            evidence.owner_git_root.as_ref(),
+        ) {
+            (Some(desc), Some(owner)) => !crate::platform::same_path(desc, owner),
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if descendant_differs {
+            if let (Some(cwd), Some(root)) = (
+                evidence.descendant_git_cwd.clone(),
+                evidence.descendant_git_root.clone(),
+            ) {
+                let hits = match self.cwd_git_hits.get(&id) {
+                    Some((prev, n)) if crate::platform::same_path(prev, &root) => {
+                        n.saturating_add(1)
+                    }
+                    _ => 1,
+                };
+                self.cwd_git_hits.insert(id, (root, hits));
+                if hits >= CWD_REHOME_STABLE_SCANS {
+                    return Some(cwd);
+                }
+            }
+        } else {
+            self.cwd_git_hits.remove(&id);
+        }
+        evidence
+            .owner_cwd
+            .clone()
+            .or_else(|| self.panes.get(&id).map(|pane| pane.cwd.clone()))
+    }
+
+    /// Put a pane tab under the open workspace whose folder actually contains
+    /// that tab's live cwd. The tab is the unit of rehoming so a split layout
+    /// stays together. Workspace roots stay static. A git project with no open
+    /// workspace gets one (no extra shell). `cd /tmp` still does nothing.
+    fn rehome_panes_by_cwd(&mut self) -> bool {
+        self.open_missing_git_workspaces();
+        let mut jobs: Vec<(PaneId, PathBuf)> = Vec::new();
+        let candidates: Vec<(usize, Vec<PaneId>)> = self
             .workspaces
             .iter()
             .enumerate()
-            .map(|(wi, ws)| (wi, git_branch(&ws.cwd)))
+            .flat_map(|(wi, ws)| {
+                ws.tabs
+                    .iter()
+                    .filter(|tab| tab.is_renameable())
+                    .map(move |tab| (wi, tab.layout.leaves()))
+            })
             .collect();
-        for (wi, branch) in branches {
-            if let Some(ws) = self.workspaces.get_mut(wi) {
-                ws.branch = branch;
+        {
+            let homes = self.workspace_homes();
+            for (wi, leaves) in candidates {
+                let Some(dest) = tab_rehome_dest(&homes, wi, &leaves, |id| {
+                    self.panes.get(&id).map(|pane| pane.cwd.as_path())
+                }) else {
+                    continue;
+                };
+                if let Some(leaf) = leaves.first() {
+                    jobs.push((*leaf, self.workspaces[dest].cwd.clone()));
+                }
             }
         }
+        let mut moved = false;
+        for (leaf, dest_cwd) in jobs {
+            let homes = self.workspace_homes();
+            let Some(dest) = workspace_index_for_cwd(&homes, &dest_cwd) else {
+                continue;
+            };
+            moved |= self.move_tab_across_workspaces(leaf, dest);
+        }
+        moved
+    }
+
+    fn workspace_homes(&self) -> Vec<(PathBuf, usize)> {
+        self.workspaces
+            .iter()
+            .enumerate()
+            .map(|(i, ws)| (ws.cwd.clone(), i))
+            .collect()
+    }
+
+    /// Open a workspace at each tab git root that no open workspace contains.
+    /// Split tabs open a workspace only when every leaf shares that root.
+    fn open_missing_git_workspaces(&mut self) {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        {
+            let homes = self.workspace_homes();
+            for ws in &self.workspaces {
+                for tab in &ws.tabs {
+                    if !tab.is_renameable() {
+                        continue;
+                    }
+                    let leaves = tab.layout.leaves();
+                    let mut agreed: Option<PathBuf> = None;
+                    let mut conflict = false;
+                    for id in &leaves {
+                        let Some(pane) = self.panes.get(id) else {
+                            conflict = true;
+                            break;
+                        };
+                        if workspace_index_for_cwd(&homes, &pane.cwd).is_some() {
+                            conflict = true;
+                            break;
+                        }
+                        let Some(root) = crate::platform::git_root(&pane.cwd) else {
+                            conflict = true;
+                            break;
+                        };
+                        match &agreed {
+                            None => agreed = Some(root),
+                            Some(prev) if !crate::platform::same_path(prev, &root) => {
+                                conflict = true;
+                                break;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    if conflict {
+                        continue;
+                    }
+                    let Some(root) = agreed else {
+                        continue;
+                    };
+                    if roots
+                        .iter()
+                        .any(|cwd| crate::platform::same_path(cwd, &root))
+                    {
+                        continue;
+                    }
+                    roots.push(root);
+                }
+            }
+        }
+        for root in roots {
+            let name = ws_name(&root);
+            let branch = git_branch(&root);
+            let worktree = worktree_membership(&root);
+            self.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
+                name,
+                cwd: root,
+                branch,
+                git_ahead_behind: None,
+                pinned: false,
+                worktree,
+                tabs: vec![],
+                active_tab: 0,
+            });
+            let ws = self.workspaces.len() - 1;
+            self.session_dirty = true;
+            self.emit_event(
+                "workspace.created",
+                serde_json::json!({"workspace": ws.to_string()}),
+            );
+        }
+    }
+
+    fn pane_tab_home(&self, pane: PaneId) -> Option<(usize, usize, bool)> {
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            for (ti, tab) in ws.tabs.iter().enumerate() {
+                if tab.layout.contains(pane) {
+                    return Some((wi, ti, tab.is_renameable()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Move the whole tab that contains `leaf` to `dest`, preserving splits.
+    /// Focus follows only when the focused pane lives on that tab.
+    fn move_tab_across_workspaces(&mut self, leaf: PaneId, dest: usize) -> bool {
+        if dest >= self.workspaces.len() {
+            return false;
+        }
+        let Some((src, ti, renameable)) = self.pane_tab_home(leaf) else {
+            return false;
+        };
+        if src == dest || !renameable {
+            return false;
+        }
+        let focused = {
+            let focus = self.layout().focus;
+            self.workspaces[src].tabs[ti].layout.contains(focus)
+        };
+        let focused_pane = self.layout().focus;
+        let tab = {
+            let ws = &mut self.workspaces[src];
+            let tab = ws.tabs.remove(ti);
+            if ws.active_tab >= ws.tabs.len() && !ws.tabs.is_empty() {
+                ws.active_tab = ws.tabs.len() - 1;
+            } else if ws.active_tab > ti {
+                ws.active_tab -= 1;
+            }
+            tab
+        };
+        let panes_in_tab = tab.layout.leaves();
+        let dest_id = self.workspaces[dest].id.clone();
+        let active_id = self.workspaces.get(self.active_ws).map(|ws| ws.id.clone());
+        self.workspaces[dest].tabs.push(tab);
+        let new_tab = self.workspaces[dest].tabs.len() - 1;
+        if self.workspaces[src].tabs.is_empty() && self.workspaces.len() > 1 {
+            self.close_workspace(src);
+        }
+        let dest = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == dest_id)
+            .unwrap_or(0);
+        if focused {
+            self.active_ws = dest;
+            self.workspaces[dest].active_tab = new_tab;
+            self.workspaces[dest].tabs[new_tab].layout.focus = focused_pane;
+            self.zoomed = false;
+        } else if let Some(active_id) = active_id {
+            if let Some(index) = self.workspaces.iter().position(|ws| ws.id == active_id) {
+                self.active_ws = index;
+            }
+        }
+        if self
+            .scroll_pane
+            .is_some_and(|id| panes_in_tab.contains(&id))
+        {
+            self.scroll_pane = None;
+        }
+        for pane in &panes_in_tab {
+            self.emit_event(
+                "pane.moved",
+                serde_json::json!({
+                    "pane": pane.0.to_string(),
+                    "workspace": dest.to_string(),
+                    "tab": (new_tab + 1).to_string(),
+                }),
+            );
+        }
+        self.session_dirty = true;
+        true
     }
 
     /// Rescan the agents' on-disk session stores for sessions you can reopen,
@@ -5381,6 +5672,51 @@ impl App {
     }
 }
 
+fn tab_rehome_dest<'a>(
+    homes: &[(PathBuf, usize)],
+    src: usize,
+    leaves: &[PaneId],
+    cwd_of: impl Fn(PaneId) -> Option<&'a std::path::Path>,
+) -> Option<usize> {
+    let dests: Vec<Option<usize>> = leaves
+        .iter()
+        .map(|id| {
+            cwd_of(*id)
+                .and_then(|cwd| workspace_index_for_cwd(homes, cwd))
+                .filter(|index| *index != src)
+        })
+        .collect();
+    if leaves.len() > 1 {
+        let dest = dests.first().copied().flatten()?;
+        dests.iter().all(|d| *d == Some(dest)).then_some(dest)
+    } else {
+        dests.first().copied().flatten()
+    }
+}
+
+fn workspace_index_for_cwd(homes: &[(PathBuf, usize)], cwd: &std::path::Path) -> Option<usize> {
+    let git_root = crate::platform::git_root(cwd);
+    let mut best: Option<(usize, usize)> = None;
+    for (root, index) in homes {
+        if !crate::platform::is_subpath(cwd, root) {
+            continue;
+        }
+        // Nested worktree/submodule has its own git root. A parent checkout
+        // that only contains that folder on disk is not this pane's home.
+        if git_root
+            .as_ref()
+            .is_some_and(|git_root| !crate::platform::is_subpath(root, git_root))
+        {
+            continue;
+        }
+        let len = root.as_os_str().len();
+        if best.is_none_or(|(best_len, _)| len > best_len) {
+            best = Some((len, *index));
+        }
+    }
+    best.map(|(_, index)| index)
+}
+
 fn ws_name(cwd: &std::path::Path) -> String {
     cwd.file_name()
         .and_then(|n| n.to_str())
@@ -5493,7 +5829,7 @@ fn restore_module_pane(
 /// The current git branch for `cwd`, if it's inside a repo. Reads `.git/HEAD`
 /// directly (no subprocess) — walks up to find the repo, follows a `.git` file
 /// for worktrees, and returns a short SHA when detached.
-fn git_branch(cwd: &std::path::Path) -> Option<String> {
+pub(crate) fn git_branch(cwd: &std::path::Path) -> Option<String> {
     let mut dir = Some(cwd);
     while let Some(d) = dir {
         let dot_git = d.join(".git");
@@ -10988,6 +11324,10 @@ mod tests {
 mod cwd_test {
     use super::*;
 
+    // Live `cd` through Windows PowerShell does not reliably update the PEB
+    // directory this reader uses. Windows coverage is process_cwd_matches_this_process
+    // plus the rehome tests below.
+    #[cfg(unix)]
     #[test]
     fn pane_cwd_follows_cd_without_moving_its_workspace() {
         let _env = crate::persist::test_env("pane-cwd-follows-cd");
@@ -11022,6 +11362,410 @@ mod cwd_test {
             workspace_name,
             "cd does not rename the static workspace"
         );
+    }
+
+    #[test]
+    fn is_subpath_treats_nested_folders_as_inside() {
+        let parent = std::path::Path::new(r"F:\Project\claude\skills");
+        assert!(crate::platform::is_subpath(parent, parent));
+        assert!(crate::platform::is_subpath(
+            std::path::Path::new(r"F:\Project\claude\skills\handoff"),
+            parent
+        ));
+        assert!(!crate::platform::is_subpath(
+            std::path::Path::new(r"F:\Project\claude\json提示词编辑器"),
+            parent
+        ));
+    }
+
+    #[test]
+    fn tab_moves_to_the_workspace_that_owns_the_pane_cwd() {
+        let _env = crate::persist::test_env("rehome-tab-cwd");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.refresh_cwds();
+        let home = app.ws().cwd.clone();
+        let other = std::env::temp_dir();
+        if crate::platform::same_path(&home, &other) {
+            return;
+        }
+        assert!(
+            app.create_workspace_at(other.clone()),
+            "second workspace opens"
+        );
+        let pane = app.layout().focus;
+        let (src, _, _) = app.pane_tab_home(pane).expect("pane has a tab");
+        assert_eq!(
+            app.workspaces[src].cwd, other,
+            "spawned in the new workspace"
+        );
+        app.panes.get_mut(&pane).unwrap().cwd = home.clone();
+        app.rehome_panes_by_cwd();
+        let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
+        assert!(
+            crate::platform::same_path(&app.workspaces[dest].cwd, &home),
+            "tab grouped under the workspace that owns the pane cwd"
+        );
+    }
+
+    #[test]
+    fn unmatched_git_cwd_opens_a_workspace_and_moves_the_tab() {
+        let _env = crate::persist::test_env("rehome-open-git");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let spawn = app.ws().cwd.clone();
+        let repo = std::env::temp_dir().join(format!(
+            "luvus-rehome-git-{}-{}",
+            std::process::id(),
+            pane.0
+        ));
+        if crate::platform::same_path(&spawn, &repo) || crate::platform::is_subpath(&repo, &spawn) {
+            return;
+        }
+        std::fs::create_dir_all(repo.join(".git")).expect("fake git root");
+        app.panes.get_mut(&pane).unwrap().cwd = repo.clone();
+        app.rehome_panes_by_cwd();
+        let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
+        assert!(
+            crate::platform::same_path(&app.workspaces[dest].cwd, &repo),
+            "unmatched git cwd opened as its own workspace"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn nested_worktree_cwd_opens_its_own_workspace() {
+        let _env = crate::persist::test_env("rehome-nested-wt");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let spawn = app.ws().cwd.clone();
+        let parent = std::env::temp_dir().join(format!(
+            "luvus-rehome-wt-parent-{}-{}",
+            std::process::id(),
+            pane.0
+        ));
+        let wt = parent.join(".worktrees").join("feat");
+        if crate::platform::same_path(&spawn, &parent)
+            || crate::platform::is_subpath(&parent, &spawn)
+        {
+            return;
+        }
+        std::fs::create_dir_all(parent.join(".git")).expect("parent git root");
+        std::fs::create_dir_all(wt.join(".git")).expect("worktree git root");
+        app.workspaces.push(Workspace {
+            id: crate::ids::public_id("workspace"),
+            name: "parent".into(),
+            cwd: parent.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            pinned: false,
+            worktree: None,
+            tabs: vec![],
+            active_tab: 0,
+        });
+        app.panes.get_mut(&pane).unwrap().cwd = wt.clone();
+        app.rehome_panes_by_cwd();
+        let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
+        assert!(
+            crate::platform::same_path(&app.workspaces[dest].cwd, &wt),
+            "nested worktree opened as its own workspace, not swallowed by parent"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn removing_an_earlier_tab_keeps_the_active_tab() {
+        let _env = crate::persist::test_env("rehome-active-tab");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let home = app.ws().cwd.clone();
+        app.new_tab();
+        app.new_tab();
+        assert_eq!(app.workspaces[0].tabs.len(), 3);
+        app.workspaces[0].active_tab = 2;
+        let first = app.workspaces[0].tabs[0].layout.leaves()[0];
+        let other = std::env::temp_dir().join(format!(
+            "luvus-rehome-active-{}-{}",
+            std::process::id(),
+            first.0
+        ));
+        if crate::platform::same_path(&home, &other) || crate::platform::is_subpath(&other, &home) {
+            return;
+        }
+        std::fs::create_dir_all(other.join(".git")).expect("dest git root");
+        assert!(app.create_workspace_at(other.clone()), "second workspace");
+        app.panes.get_mut(&first).unwrap().cwd = other.clone();
+        app.rehome_panes_by_cwd();
+        let src = app
+            .workspaces
+            .iter()
+            .position(|ws| crate::platform::same_path(&ws.cwd, &home))
+            .expect("home workspace remains");
+        assert_eq!(
+            app.workspaces[src].tabs.len(),
+            2,
+            "earlier tab left the workspace"
+        );
+        assert_eq!(
+            app.workspaces[src].active_tab, 1,
+            "active tab stayed on the same tab object after the earlier removal"
+        );
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn last_tab_rehome_closes_source_workspace_through_helper() {
+        let _env = crate::persist::test_env("rehome-close-helper");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let home = app.ws().cwd.clone();
+        let home_id = app.ws().id.clone();
+        let pane = app.layout().focus;
+        let other = std::env::temp_dir().join(format!(
+            "luvus-rehome-close-{}-{}",
+            std::process::id(),
+            pane.0
+        ));
+        if crate::platform::same_path(&home, &other) || crate::platform::is_subpath(&other, &home) {
+            return;
+        }
+        std::fs::create_dir_all(other.join(".git")).expect("dest git root");
+        let (files_reply, files_rx) = std::sync::mpsc::channel();
+        app.pending_file_tree_api.push((
+            home.clone(),
+            crate::ipc::api::ApiRequest {
+                id: "files".into(),
+                method: "files.tree".into(),
+                params: serde_json::Value::Null,
+                reply: files_reply,
+            },
+        ));
+        let (diff_reply, diff_rx) = std::sync::mpsc::channel();
+        app.pending_diff_api.push((
+            home.clone(),
+            crate::ipc::api::ApiRequest {
+                id: "diff".into(),
+                method: "diff.list".into(),
+                params: serde_json::Value::Null,
+                reply: diff_reply,
+            },
+        ));
+        app.ws_rename = Some(WsRename {
+            workspace_id: home_id.clone(),
+            buffer: "keep".into(),
+        });
+        app.worktree_delete = Some(home_id.clone());
+        assert!(app.create_workspace_at(other.clone()), "second workspace");
+        app.panes.get_mut(&pane).unwrap().cwd = other.clone();
+        app.rehome_panes_by_cwd();
+        assert!(
+            app.workspaces
+                .iter()
+                .all(|ws| !crate::platform::same_path(&ws.cwd, &home)),
+            "empty source workspace closed"
+        );
+        let files = files_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("FILES waiter failed when rehome closed the workspace");
+        assert!(files.contains("workspace closed"), "{files}");
+        let diff = diff_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("DIFF waiter failed when rehome closed the workspace");
+        assert!(diff.contains("workspace closed"), "{diff}");
+        assert!(app.ws_rename.is_none(), "rename modal disarmed");
+        assert!(app.worktree_delete.is_none(), "worktree-delete disarmed");
+        let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
+        assert!(crate::platform::same_path(
+            &app.workspaces[dest].cwd,
+            &other
+        ));
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn unfocused_last_tab_rehome_keeps_the_viewing_workspace() {
+        let _env = crate::persist::test_env("rehome-keep-view");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let home = app.ws().cwd.clone();
+        let pane_a = app.layout().focus;
+        let mid = std::env::temp_dir().join(format!(
+            "luvus-rehome-view-b-{}-{}",
+            std::process::id(),
+            pane_a.0
+        ));
+        let dest = std::env::temp_dir().join(format!(
+            "luvus-rehome-view-c-{}-{}",
+            std::process::id(),
+            pane_a.0
+        ));
+        if crate::platform::same_path(&home, &mid)
+            || crate::platform::same_path(&home, &dest)
+            || crate::platform::is_subpath(&mid, &home)
+            || crate::platform::is_subpath(&dest, &home)
+        {
+            return;
+        }
+        std::fs::create_dir_all(mid.join(".git")).expect("B git root");
+        std::fs::create_dir_all(dest.join(".git")).expect("C git root");
+        assert!(app.create_workspace_at(mid.clone()), "workspace B");
+        assert!(app.create_workspace_at(dest.clone()), "workspace C");
+        assert_eq!(app.workspaces.len(), 3);
+        app.active_ws = 1;
+        app.panes.get_mut(&pane_a).unwrap().cwd = dest.clone();
+        app.rehome_panes_by_cwd();
+        assert!(
+            crate::platform::same_path(&app.ws().cwd, &mid),
+            "viewing B must survive A closing; got {:?}",
+            app.ws().cwd
+        );
+        let (wi, _, _) = app.pane_tab_home(pane_a).expect("pane still has a tab");
+        assert!(crate::platform::same_path(&app.workspaces[wi].cwd, &dest));
+        let _ = std::fs::remove_dir_all(&mid);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn background_rehome_preserves_zoom_and_scroll() {
+        let _env = crate::persist::test_env("rehome-zoom");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let home = app.ws().cwd.clone();
+        app.new_tab();
+        app.new_tab();
+        app.workspaces[0].active_tab = 2;
+        let focus = app.layout().focus;
+        let first = app.workspaces[0].tabs[0].layout.leaves()[0];
+        let other = std::env::temp_dir().join(format!(
+            "luvus-rehome-zoom-{}-{}",
+            std::process::id(),
+            first.0
+        ));
+        if crate::platform::same_path(&home, &other) || crate::platform::is_subpath(&other, &home) {
+            return;
+        }
+        std::fs::create_dir_all(other.join(".git")).expect("dest git root");
+        assert!(app.create_workspace_at(other.clone()), "second workspace");
+        app.active_ws = 0;
+        app.workspaces[0].active_tab = 2;
+        app.zoomed = true;
+        app.scroll_pane = Some(focus);
+        app.panes.get_mut(&first).unwrap().cwd = other.clone();
+        app.rehome_panes_by_cwd();
+        assert!(app.zoomed, "background rehome must not drop zoom");
+        assert_eq!(
+            app.scroll_pane,
+            Some(focus),
+            "scroll mode stays on the focused pane"
+        );
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn split_tab_rehomes_together() {
+        let _env = crate::persist::test_env("rehome-split");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.split(crate::layout::Axis::Col);
+        let leaves = app.layout().leaves();
+        assert_eq!(leaves.len(), 2);
+        let other = std::env::temp_dir().join(format!(
+            "luvus-rehome-split-{}-{}",
+            std::process::id(),
+            leaves[0].0
+        ));
+        let home = app.ws().cwd.clone();
+        if crate::platform::same_path(&home, &other) || crate::platform::is_subpath(&other, &home) {
+            return;
+        }
+        std::fs::create_dir_all(other.join(".git")).expect("dest git root");
+        assert!(app.create_workspace_at(other.clone()), "second workspace");
+        for id in &leaves {
+            app.panes.get_mut(id).unwrap().cwd = other.clone();
+        }
+        app.rehome_panes_by_cwd();
+        let (dest, ti, _) = app.pane_tab_home(leaves[0]).expect("pane still has a tab");
+        assert!(
+            crate::platform::same_path(&app.workspaces[dest].cwd, &other),
+            "split tab moved as a unit"
+        );
+        let moved = app.workspaces[dest].tabs[ti].layout.leaves();
+        assert_eq!(moved.len(), 2, "split layout survived rehoming");
+        assert!(moved.contains(&leaves[0]));
+        assert!(moved.contains(&leaves[1]));
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn split_tab_stays_when_only_one_pane_matches() {
+        let _env = crate::persist::test_env("rehome-split-stay");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.split(crate::layout::Axis::Col);
+        let leaves = app.layout().leaves();
+        assert_eq!(leaves.len(), 2);
+        let home = app.ws().cwd.clone();
+        let other = std::env::temp_dir().join(format!(
+            "luvus-rehome-split-stay-{}-{}",
+            std::process::id(),
+            leaves[0].0
+        ));
+        if crate::platform::same_path(&home, &other) || crate::platform::is_subpath(&other, &home) {
+            return;
+        }
+        std::fs::create_dir_all(other.join(".git")).expect("dest git root");
+        assert!(app.create_workspace_at(other.clone()), "second workspace");
+        app.panes.get_mut(&leaves[0]).unwrap().cwd = other.clone();
+        app.panes.get_mut(&leaves[1]).unwrap().cwd = home.clone();
+        app.rehome_panes_by_cwd();
+        let (a, ta, _) = app.pane_tab_home(leaves[0]).expect("first pane");
+        let (b, tb, _) = app.pane_tab_home(leaves[1]).expect("second pane");
+        assert_eq!((a, ta), (b, tb), "split was not torn apart");
+        assert!(
+            crate::platform::same_path(&app.workspaces[a].cwd, &home),
+            "mixed split stayed in the original workspace"
+        );
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn short_lived_descendant_git_cwd_does_not_rehome() {
+        let _env = crate::persist::test_env("rehome-stable-cwd");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let home = app.ws().cwd.clone();
+        let other = std::env::temp_dir().join(format!(
+            "luvus-rehome-stable-{}-{}",
+            std::process::id(),
+            pane.0
+        ));
+        if crate::platform::same_path(&home, &other) || crate::platform::is_subpath(&other, &home) {
+            return;
+        }
+        std::fs::create_dir_all(other.join(".git")).expect("descendant git root");
+        let evidence = crate::platform::PaneCwdEvidence {
+            pid: 1,
+            owner_cwd: Some(home.clone()),
+            owner_git_root: crate::platform::git_root(&home),
+            descendant_git_cwd: Some(other.clone()),
+            descendant_git_root: Some(other.clone()),
+        };
+        app.apply_cwd_scan(vec![(pane, evidence.clone())], Vec::new());
+        let (src, _, _) = app.pane_tab_home(pane).expect("pane has a tab");
+        assert!(
+            crate::platform::same_path(&app.workspaces[src].cwd, &home),
+            "one scan of a descendant git cwd must not move the tab"
+        );
+        app.apply_cwd_scan(vec![(pane, evidence)], Vec::new());
+        let (dest, _, _) = app.pane_tab_home(pane).expect("pane still has a tab");
+        assert!(
+            crate::platform::same_path(&app.workspaces[dest].cwd, &other),
+            "stable descendant git cwd rehomes the tab"
+        );
+        let _ = std::fs::remove_dir_all(&other);
     }
 }
 
