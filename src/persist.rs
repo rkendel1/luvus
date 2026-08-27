@@ -429,6 +429,69 @@ pub fn session_dir() -> PathBuf {
     crate::session::active_dir()
 }
 
+/// Records the live server PID so `server stop` can kill an unresponsive process
+/// without waiting on IPC. Dropped on a clean server exit; a crash leaves the
+/// file, and the stopper still checks the PID is a Luvus process we own.
+pub struct ServerPidFile;
+
+impl ServerPidFile {
+    pub fn claim() -> Self {
+        let pid = std::process::id();
+        let mut body = pid.to_string();
+        if let Some(marker) = crate::platform::process_start_marker(pid) {
+            body.push(' ');
+            body.push_str(&marker);
+        }
+        let _ = fs::write(session_dir().join("server.pid"), body);
+        Self
+    }
+
+    pub fn read() -> Option<u32> {
+        let text = fs::read_to_string(session_dir().join("server.pid")).ok()?;
+        let mut parts = text.split_whitespace();
+        let pid: u32 = parts.next()?.parse().ok()?;
+        if let Some(recorded) = parts.next() {
+            let live = crate::platform::process_start_marker(pid)?;
+            if live != recorded {
+                return None;
+            }
+        }
+        Some(pid)
+    }
+}
+
+impl Drop for ServerPidFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(session_dir().join("server.pid"));
+    }
+}
+
+#[cfg(test)]
+mod server_pid_file_tests {
+    use super::*;
+
+    #[test]
+    fn server_pid_file_reads_the_live_process() {
+        let _env = test_env("server-pid-live");
+        ensure_session_dir();
+        let claimed = ServerPidFile::claim();
+        assert_eq!(ServerPidFile::read(), Some(std::process::id()));
+        drop(claimed);
+        assert_eq!(ServerPidFile::read(), None);
+    }
+
+    #[test]
+    fn server_pid_file_rejects_a_mismatched_start_marker() {
+        let _env = test_env("server-pid-mismatch");
+        ensure_session_dir();
+        let claimed = ServerPidFile::claim();
+        let path = session_dir().join("server.pid");
+        fs::write(&path, format!("{} not-a-live-marker", std::process::id())).unwrap();
+        assert_eq!(ServerPidFile::read(), None);
+        drop(claimed);
+    }
+}
+
 /// Create the selected runtime directory with the same owner-only protection as
 /// the global root. This is the startup-lock namespace for one server only.
 pub fn ensure_session_dir() -> PathBuf {
