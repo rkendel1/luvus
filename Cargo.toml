@@ -87,11 +87,10 @@ fs2 = "0.4"
 # derived from pane routes, PIDs, clocks, or process-global counters.
 getrandom = "0.3"
 
-# ── State Graph (FeltDB integration) ─────────────────────────────────────────
+# ── State Graph ───────────────────────────────────────────────────────────────
 # StateDB records every workspace/pane/agent mutation as a queryable operation.
-# FeltDB provides CRDT-backed storage with queryable document/operation history.
-# When the felt_db crate becomes available on crates.io, uncomment:
-# felt_db = "0.6"
+# This is a local operation log with JSON checkpoint persistence, not a
+# distributed CRDT database.
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"

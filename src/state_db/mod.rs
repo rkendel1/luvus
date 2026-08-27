@@ -1,4 +1,4 @@
-//! State graph backed by FeltDB — CRDT-based queryable history for agents.
+//! State graph: queryable operation history for agents.
 //!
 //! Every app mutation flows through here: pane creation, agent status changes,
 //! workspace modifications. The state graph provides agents with full context
@@ -6,10 +6,13 @@
 //!
 //! # Architecture
 //!
-//! The StateDb uses FeltDB as its CRDT-backed storage engine:
-//! - CRDT-based conflict resolution for concurrent edits
-//! - Queryable operation history (not just current state)
-//! - Full audit trail for debugging, replay, and reasoning
+//! The StateDb is a single-writer operation log with:
+//! - In-memory index for fast queries (DashMap by entity)
+//! - Global sequence-numbered operation log
+//! - JSON checkpoint persistence
+//!
+//! This is **not** a CRDT or distributed database. It is a local state store
+//! that records operations for agent context and debugging.
 //!
 //! # Usage
 //!
@@ -31,12 +34,10 @@
 //! ```
 
 pub mod agent_context;
-pub mod felt_db;
 pub mod operations;
 pub mod queries;
 
 pub use agent_context::AgentContext;
-pub use felt_db::FeltDb;
 pub use operations::{EntityType, OpError, OpType, StateOp};
 pub use queries::StateQuery;
 
@@ -56,16 +57,15 @@ const MAX_TOTAL_OPS: usize = 100_000;
 /// Default time window for "recent" operations in agent context (1 hour).
 const DEFAULT_RECENT_WINDOW_HOURS: i64 = 1;
 
-/// FeltDB-backed state graph: all app mutations recorded as CRDT operations.
+/// Local state graph: all app mutations recorded as queryable operations.
 ///
 /// Thread-safe and lock-free for reads; writes use fine-grained locking per
-/// entity. Uses FeltDB for authoritative CRDT storage with full operation
-/// history, plus a DashMap index for fast in-memory queries.
+/// entity. Uses DashMap for fast in-memory indexing with JSON checkpoint
+/// persistence.
+///
+/// This is a single-writer operation log, not a CRDT or distributed database.
 #[derive(Clone)]
 pub struct StateDb {
-    /// FeltDB instance (CRDT-backed document store).
-    feltdb: Option<Arc<FeltDb>>,
-
     /// In-memory index of operations by entity id (for fast queries).
     ops_by_entity: Arc<DashMap<String, Vec<StateOp>>>,
 
@@ -83,21 +83,9 @@ pub struct StateDb {
 }
 
 impl StateDb {
-    /// Initialize the state database with FeltDB backend.
+    /// Initialize the state database.
     pub fn new(home_dir: &Path) -> anyhow::Result<Self> {
-        // Initialize FeltDB with persistence
-        let feltdb_path = home_dir.join("feltdb_state.json");
-        let feltdb = match FeltDb::with_persistence(&feltdb_path) {
-            Ok(db) => Some(Arc::new(db)),
-            Err(e) => {
-                eprintln!("state_db: FeltDB init warning: {e}");
-                // Fall back to in-memory FeltDB
-                FeltDb::new().ok().map(Arc::new)
-            }
-        };
-
         let db = Self {
-            feltdb,
             ops_by_entity: Arc::new(DashMap::new()),
             global_log: Arc::new(DashMap::new()),
             sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -114,26 +102,12 @@ impl StateDb {
         Ok(db)
     }
 
-    /// Check if FeltDB backend is available.
-    pub fn has_feltdb(&self) -> bool {
-        self.feltdb.is_some()
-    }
-
     /// Record a state operation.
     ///
     /// This is non-blocking and safe to call from any thread. Operations are
-    /// recorded to FeltDB and indexed in memory for fast queries.
+    /// indexed in memory for fast queries.
     pub fn record_op(&self, op: StateOp) {
         let entity_id = op.entity_id.clone();
-
-        // Record to FeltDB
-        if let Some(feltdb) = &self.feltdb {
-            let key = format!("ops:{}:{}", op.entity_id, op.id);
-            let value = serde_json::to_value(&op).unwrap_or_default();
-            if let Err(e) = feltdb.insert_doc(&key, value) {
-                eprintln!("state_db: FeltDB insert failed: {e}");
-            }
-        }
 
         // Add to global log (in-memory)
         let seq = self
@@ -256,17 +230,11 @@ impl StateDb {
     /// Get summary statistics about the state database.
     pub fn stats(&self) -> StateDbStats {
         let total_ops: usize = self.ops_by_entity.iter().map(|e| e.value().len()).sum();
-        let feltdb_sequence = self
-            .feltdb
-            .as_ref()
-            .map(|f| f.get_sequence())
-            .unwrap_or(0);
         StateDbStats {
             total_operations: total_ops,
             entity_count: self.ops_by_entity.len(),
             checkpoint_at: *self.checkpoint_at.read().unwrap(),
-            feltdb_available: self.feltdb.is_some(),
-            feltdb_sequence,
+            sequence: self.sequence.load(std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -274,11 +242,6 @@ impl StateDb {
     ///
     /// Called periodically (e.g., every 2 seconds like session saves).
     pub fn checkpoint(&self) -> anyhow::Result<()> {
-        // Persist FeltDB
-        if let Some(feltdb) = &self.feltdb {
-            feltdb.persist()?;
-        }
-
         let checkpoint_path = self.home_dir.join("state_db.json");
 
         // Collect all operations
@@ -391,10 +354,8 @@ pub struct StateDbStats {
     pub entity_count: usize,
     /// When the last checkpoint was written.
     pub checkpoint_at: DateTime<Utc>,
-    /// Whether FeltDB backend is available.
-    pub feltdb_available: bool,
-    /// FeltDB sequence number (CRDT operation count).
-    pub feltdb_sequence: u64,
+    /// Current sequence number (operation count).
+    pub sequence: u64,
 }
 
 #[cfg(test)]
