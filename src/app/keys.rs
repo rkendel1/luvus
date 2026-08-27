@@ -48,6 +48,7 @@ pub enum Cmd {
     CloseWorkspace,
     NextWorkspace,
     PrevWorkspace,
+    JumpWorkspace(u8),
     NewWorktree,
     OpenGit,
     OpenMission,
@@ -86,6 +87,15 @@ impl Cmd {
         Cmd::CloseWorkspace,
         Cmd::NextWorkspace,
         Cmd::PrevWorkspace,
+        Cmd::JumpWorkspace(1),
+        Cmd::JumpWorkspace(2),
+        Cmd::JumpWorkspace(3),
+        Cmd::JumpWorkspace(4),
+        Cmd::JumpWorkspace(5),
+        Cmd::JumpWorkspace(6),
+        Cmd::JumpWorkspace(7),
+        Cmd::JumpWorkspace(8),
+        Cmd::JumpWorkspace(9),
         Cmd::NewWorktree,
         Cmd::OpenGit,
         Cmd::OpenMission,
@@ -124,6 +134,17 @@ impl Cmd {
             Cmd::CloseWorkspace => "close_node",
             Cmd::NextWorkspace => "next_node",
             Cmd::PrevWorkspace => "prev_node",
+            Cmd::JumpWorkspace(position) => [
+                "jump_workspace_1",
+                "jump_workspace_2",
+                "jump_workspace_3",
+                "jump_workspace_4",
+                "jump_workspace_5",
+                "jump_workspace_6",
+                "jump_workspace_7",
+                "jump_workspace_8",
+                "jump_workspace_9",
+            ][position.saturating_sub(1).min(8) as usize],
             Cmd::NewWorktree => "new_worktree",
             Cmd::OpenGit => "open_git",
             Cmd::OpenMission => "open_mission",
@@ -165,6 +186,9 @@ impl Cmd {
             Cmd::CloseWorkspace => cat.cmd_close_workspace,
             Cmd::NextWorkspace => cat.cmd_next_workspace,
             Cmd::PrevWorkspace => cat.cmd_prev_workspace,
+            Cmd::JumpWorkspace(position) => {
+                cat.cmd_jump_workspace[position.saturating_sub(1).min(8) as usize]
+            }
             Cmd::NewWorktree => cat.cmd_new_worktree,
             Cmd::OpenGit => cat.cmd_open_git,
             Cmd::OpenMission => cat.mc_open,
@@ -204,6 +228,7 @@ impl Cmd {
             | Cmd::CloseWorkspace
             | Cmd::NextWorkspace
             | Cmd::PrevWorkspace
+            | Cmd::JumpWorkspace(_)
             | Cmd::NewWorktree => cat.settings.keys_sections[2],
             Cmd::OpenGit
             | Cmd::OpenMission
@@ -243,6 +268,7 @@ impl Cmd {
             Cmd::CloseWorkspace => "D",
             Cmd::NextWorkspace => "w",
             Cmd::PrevWorkspace => "W",
+            Cmd::JumpWorkspace(_) => "",
             Cmd::NewWorktree => "G",
             Cmd::OpenGit => "g",
             Cmd::OpenMission => "m",
@@ -266,7 +292,10 @@ impl Cmd {
     /// from `build_keymap` — every binding now flows through this list or a user
     /// override, so nothing is bound behind the user's back.
     pub fn default_keys(self) -> Vec<&'static str> {
-        let mut keys = vec![self.default_key()];
+        let mut keys = match self.default_key() {
+            "" => Vec::new(),
+            key => vec![key],
+        };
         let aliases: &[&str] = match self {
             Cmd::FocusLeft => &["h"],
             Cmd::FocusDown => &["j"],
@@ -673,6 +702,14 @@ impl App {
             }
             Cmd::NextWorkspace => self.cycle_workspace(1),
             Cmd::PrevWorkspace => self.cycle_workspace(-1),
+            Cmd::JumpWorkspace(position) => {
+                if let Some(&(workspace, _)) = self
+                    .workspace_display_order()
+                    .get(position.saturating_sub(1) as usize)
+                {
+                    self.active_ws = workspace;
+                }
+            }
             Cmd::NewWorktree => self.open_worktree_prompt(),
             Cmd::OpenGit => self.open_git_tab_active(),
             Cmd::OpenMission => self.open_mission_control(self.active_ws),
@@ -741,10 +778,73 @@ mod tests {
         assert_eq!(m.get("y"), Some(&Cmd::CopyMode));
         assert_eq!(m.get("m"), Some(&Cmd::OpenMission));
         assert_eq!(m.get("M"), Some(&Cmd::Switcher));
-        // every command is reachable by its default key
+        // Every command with a default is reachable. Direct workspace jumps are
+        // intentionally unbound because shifted digits vary by terminal/layout.
         for &c in Cmd::ALL {
-            assert!(m.values().any(|v| *v == c), "{c:?} bound");
+            assert_eq!(
+                m.values().any(|v| *v == c),
+                !c.default_keys().is_empty(),
+                "{c:?} default binding"
+            );
         }
+        assert!(!m.contains_key(""), "unbound commands do not claim a key");
+    }
+
+    #[test]
+    fn workspace_jump_ids_are_stable_and_rebindable() {
+        let mut overrides = HashMap::new();
+        for position in 1..=9 {
+            let command = Cmd::JumpWorkspace(position);
+            assert_eq!(command.id(), format!("jump_workspace_{position}"));
+            assert!(command.default_keys().is_empty());
+        }
+
+        overrides.insert("jump_workspace_4".into(), "!".into());
+        assert_eq!(
+            build_keymap(&overrides).get("!"),
+            Some(&Cmd::JumpWorkspace(4))
+        );
+    }
+
+    #[test]
+    fn workspace_jump_uses_sidebar_order_and_preserves_target_focus() {
+        let _env = crate::persist::test_env("jump-workspace-display-order");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        for position in 2..=3 {
+            app.workspaces.push(Workspace {
+                id: crate::ids::public_id("workspace"),
+                name: format!("workspace-{position}"),
+                cwd: std::path::PathBuf::from(format!("/tmp/workspace-{position}")),
+                branch: None,
+                git_ahead_behind: None,
+                worktree: None,
+                tabs: vec![Tab::panes(TileLayout::new(focus))],
+                active_tab: 0,
+                pinned: position == 3,
+            });
+        }
+        app.workspaces[2]
+            .tabs
+            .push(Tab::panes(TileLayout::new(focus)));
+        app.workspaces[2].active_tab = 1;
+
+        assert_eq!(
+            app.workspace_display_order(),
+            vec![(2, false), (0, false), (1, false)]
+        );
+        app.run_cmd(Cmd::JumpWorkspace(1));
+        assert_eq!(app.active_ws, 2, "position resolves through sidebar order");
+        assert_eq!(app.ws().active_tab, 1, "target active tab is preserved");
+        assert_eq!(
+            app.layout().focus,
+            focus,
+            "target focused pane is preserved"
+        );
+
+        app.run_cmd(Cmd::JumpWorkspace(9));
+        assert_eq!(app.active_ws, 2, "an unavailable position is a no-op");
     }
 
     #[test]
