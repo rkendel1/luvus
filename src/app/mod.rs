@@ -1749,6 +1749,11 @@ pub struct App {
     pub module_startup_done: std::collections::HashSet<String>,
     /// The module-settings row being edited in Settings → Modules, if any.
     pub module_setting_edit: Option<ModuleSettingEdit>,
+    /// FeltDB-style state graph: all app mutations recorded as typed operations.
+    /// Agents can query this for full context about what has happened.
+    /// Phase 1: initialized but not yet wired to all mutation points.
+    #[allow(dead_code)]
+    pub state_db: Option<std::sync::Arc<crate::state_db::StateDb>>,
 }
 
 /// The inline text prompt for a `type = "string"` module setting (docs/13 §3.6).
@@ -2043,6 +2048,12 @@ impl App {
             module_panes: HashMap::new(),
             module_startup_done: std::collections::HashSet::new(),
             module_setting_edit: None,
+            state_db: {
+                let home = crate::persist::config_dir();
+                crate::state_db::StateDb::new(&home)
+                    .ok()
+                    .map(std::sync::Arc::new)
+            },
         };
         // A fresh start still loads `orch.json` — its pane bindings belong to a
         // previous server run, so rebind/clear them (same as `from_snapshot`).
@@ -2583,6 +2594,12 @@ impl App {
             module_panes,
             module_startup_done: std::collections::HashSet::new(),
             module_setting_edit: None,
+            state_db: {
+                let home = crate::persist::config_dir();
+                crate::state_db::StateDb::new(&home)
+                    .ok()
+                    .map(std::sync::Arc::new)
+            },
         };
         // Pane ids are reallocated every run, so the ledger's pane bindings from
         // the previous server are stale — rebind them to the restored panes (by
@@ -2598,6 +2615,29 @@ impl App {
             self.downsample = true;
             self.theme = self.theme.to_256();
         }
+    }
+
+    /// Record a state operation to the state graph (fire-and-forget).
+    ///
+    /// This is safe to call from any context — the operation is recorded
+    /// asynchronously and does not block the caller.
+    /// Phase 1: not yet wired to all mutation points.
+    #[allow(dead_code)]
+    pub fn record_mutation(&self, op: crate::state_db::StateOp) {
+        if let Some(db) = &self.state_db {
+            db.record_op(op);
+        }
+    }
+
+    /// Get agent context for a workspace from the state graph.
+    ///
+    /// Returns the current state snapshot plus recent operation history.
+    /// Phase 1: available but not yet exposed via UHP.
+    #[allow(dead_code)]
+    pub fn workspace_context(&self, workspace_id: &str) -> Option<crate::state_db::AgentContext> {
+        self.state_db
+            .as_ref()
+            .map(|db| db.agent_context(workspace_id))
     }
 
     /// Apply colors reported by the terminal displaying the foreground client.

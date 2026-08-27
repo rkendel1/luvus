@@ -30,6 +30,7 @@ mod platform;
 mod search;
 mod session;
 mod skill;
+pub mod state_db;
 mod terminal;
 mod theme;
 mod ui;
