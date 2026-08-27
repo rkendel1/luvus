@@ -909,6 +909,20 @@ impl App {
                 .workspace_of_pane(id)
                 .map(|ws| (ws.name.clone(), ws.branch.clone()))
                 .unwrap_or_default();
+            // Record state operation for agent status change
+            let old_state = self
+                .status
+                .get(&id)
+                .map(|s| state_str(s.state))
+                .unwrap_or("unknown");
+            self.record_mutation(crate::state_db::StateOp::new(
+                id.0.to_string(),
+                crate::state_db::EntityType::Agent,
+                crate::state_db::OpType::AgentStatusChanged {
+                    old: old_state.to_string(),
+                    new: state_str(st).to_string(),
+                },
+            ));
             self.emit_event(
                 "pane.agent_status_changed",
                 json!({
@@ -2070,6 +2084,14 @@ impl App {
                 }
                 self.set_agent_name(pane, (!name.is_empty()).then_some(name));
                 self.emit_event("pane.renamed", json!({"pane":pane.0.to_string(),"name":if name.is_empty(){Value::Null}else{json!(name)}}));
+                // Record state operation for pane rename
+                self.record_mutation(crate::state_db::StateOp::new(
+                    pane.0.to_string(),
+                    crate::state_db::EntityType::Pane,
+                    crate::state_db::OpType::PaneNameSet {
+                        name: name.to_string(),
+                    },
+                ));
                 Ok(
                     json!({"type":"pane_rename","pane":pane.0.to_string(),"name":if name.is_empty(){Value::Null}else{json!(name)}}),
                 )
@@ -3695,7 +3717,7 @@ impl App {
                 let task = self
                     .orch
                     .add_task(
-                        title,
+                        title.clone(),
                         str_array(p, "paths"),
                         str_array(p, "deps"),
                         opt_str(p, "gate"),
@@ -3703,6 +3725,15 @@ impl App {
                     .map_err(orch_err)?;
                 self.orch.save();
                 self.emit_event("task.added", task_json(&task));
+                // Record state operation for task creation
+                self.record_mutation(crate::state_db::StateOp::new(
+                    task.id.clone(),
+                    crate::state_db::EntityType::Task,
+                    crate::state_db::OpType::TaskCreated {
+                        task_id: task.id.clone(),
+                        title,
+                    },
+                ));
                 Ok(json!({ "type": "task", "task": task_json(&task) }))
             }
             "task.list" => Ok(json!({
@@ -3744,6 +3775,15 @@ impl App {
                         ("bad_request".to_string(), format!("unknown status: {s}"))
                     })?;
                     self.orch.set_status(&id, st).map_err(orch_err)?;
+                    // Record state operation for task update
+                    self.record_mutation(crate::state_db::StateOp::new(
+                        id.clone(),
+                        crate::state_db::EntityType::Task,
+                        crate::state_db::OpType::TaskUpdated {
+                            task_id: id.clone(),
+                            status: s.to_string(),
+                        },
+                    ));
                 }
                 if let Some(o) = p.get("output").and_then(|v| v.as_str()) {
                     self.orch.add_output(&id, o.to_string()).map_err(orch_err)?;

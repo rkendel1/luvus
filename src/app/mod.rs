@@ -1749,10 +1749,13 @@ pub struct App {
     pub module_startup_done: std::collections::HashSet<String>,
     /// The module-settings row being edited in Settings → Modules, if any.
     pub module_setting_edit: Option<ModuleSettingEdit>,
-    /// FeltDB-style state graph: all app mutations recorded as typed operations.
+    /// State graph: all app mutations recorded as typed operations.
     /// Agents can query this for full context about what has happened.
-    /// Phase 1: initialized but not yet wired to all mutation points.
-    #[allow(dead_code)]
+    ///
+    /// Records operations for: workspaces (create/rename/pin/unpin/delete/focus),
+    /// tabs (create/rename/close), panes (create/close/split/rename/focus),
+    /// agents (status changes), and tasks (create/update/complete/fail).
+    /// Checkpointed alongside session saves.
     pub state_db: Option<std::sync::Arc<crate::state_db::StateDb>>,
 }
 
@@ -2627,6 +2630,17 @@ impl App {
         }
     }
 
+    /// Checkpoint the state database to disk.
+    ///
+    /// Called alongside session saves to persist the operation history.
+    pub fn checkpoint_state_db(&self) {
+        if let Some(db) = &self.state_db {
+            if let Err(e) = db.checkpoint() {
+                eprintln!("state_db: checkpoint failed: {e}");
+            }
+        }
+    }
+
     /// Get agent context for a workspace from the state graph.
     ///
     /// Returns the current state snapshot plus recent operation history.
@@ -3133,6 +3147,17 @@ impl App {
         };
         if let Some(id) = self.spawn_into_deferred(cwd.clone(), fallback_cwds) {
             self.layout_mut().split_focused(axis, id);
+            // Record the split operation
+            self.record_mutation(crate::state_db::StateOp::new(
+                id.0.to_string(),
+                crate::state_db::EntityType::Pane,
+                crate::state_db::OpType::PaneSplit {
+                    direction: match axis {
+                        Axis::Col => "horizontal".to_string(),
+                        Axis::Row => "vertical".to_string(),
+                    },
+                },
+            ));
         }
     }
 
@@ -3361,6 +3386,12 @@ impl App {
                     workspace_id,
                     crate::state_db::EntityType::Workspace,
                     crate::state_db::OpType::WorkspacePinned,
+                ));
+            } else {
+                self.record_mutation(crate::state_db::StateOp::new(
+                    workspace_id,
+                    crate::state_db::EntityType::Workspace,
+                    crate::state_db::OpType::WorkspaceUnpinned,
                 ));
             }
         }
@@ -4673,8 +4704,19 @@ impl App {
         if !tab.is_renameable() {
             return Err(TabRenameError::Dashboard);
         }
-        tab.name = (!name.is_empty()).then(|| name.to_string());
+        let old_name = tab.name.clone();
+        let new_name = (!name.is_empty()).then(|| name.to_string());
+        tab.name = new_name.clone();
         self.session_dirty = true;
+        // Record state operation for tab rename
+        self.record_mutation(crate::state_db::StateOp::new(
+            format!("tab-{}-{}", workspace, index),
+            crate::state_db::EntityType::Tab,
+            crate::state_db::OpType::TabRenamed {
+                old: old_name,
+                new: new_name,
+            },
+        ));
         Ok(())
     }
 

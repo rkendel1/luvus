@@ -406,6 +406,15 @@ impl App {
                 "task.gate_failed",
                 serde_json::json!({ "id": id, "code": code }),
             );
+            // Record state operation for task failure
+            self.record_mutation(crate::state_db::StateOp::new(
+                id.to_string(),
+                crate::state_db::EntityType::Task,
+                crate::state_db::OpType::TaskFailed {
+                    task_id: id.to_string(),
+                    reason: format!("gate failed (exit {code_s})"),
+                },
+            ));
         }
     }
 
@@ -422,6 +431,14 @@ impl App {
             .and_then(|t| serde_json::to_value(t).ok())
             .unwrap_or(serde_json::Value::Null);
         self.emit_event("task.done", tj);
+        // Record state operation for task completion
+        self.record_mutation(crate::state_db::StateOp::new(
+            id.to_string(),
+            crate::state_db::EntityType::Task,
+            crate::state_db::OpType::TaskCompleted {
+                task_id: id.to_string(),
+            },
+        ));
         for rid in ready {
             self.emit_event("task.ready", serde_json::json!({ "id": rid }));
         }

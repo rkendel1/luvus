@@ -1005,6 +1005,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         // Debounced session save.
         if app.session_dirty && last_save.elapsed() > Duration::from_secs(2) {
             persist::save(&app);
+            app.checkpoint_state_db();
             app.session_dirty = false;
             last_save = Instant::now();
         }
@@ -1054,6 +1055,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
 
     let detached = app.detach_requested;
     persist::save(&app);
+    app.checkpoint_state_db();
     Ok(detached)
 }
 
