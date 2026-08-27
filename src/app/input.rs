@@ -115,6 +115,40 @@ fn strip_uniform_single_cell_margin(text: String) -> String {
         .join("\n")
 }
 
+/// A second left click within this of the first, on the same cell (±1), is a
+/// double-click. Terminals emit no native double-click, so luvus times it.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// A run of grid cells on one row: `(row, start_col, end_col)`, `end_col`
+/// exclusive — the same shape as [`crate::links::Link::spans`].
+type CellSpan = (u16, u16, u16);
+
+/// The whitespace-delimited word covering grid cell (`col`, `row`), and the one
+/// span it occupies. `None` on a whitespace or out-of-range cell. Char indices
+/// are the columns, matching how [`crate::links::link_at`] and the grid renderer
+/// address cells.
+fn word_at_grid(rows: &[String], col: u16, row: u16) -> Option<(String, Vec<CellSpan>)> {
+    let line = rows.get(row as usize)?;
+    let chars: Vec<char> = line.chars().collect();
+    let idx = col as usize;
+    if idx >= chars.len() || chars[idx].is_whitespace() {
+        return None;
+    }
+    let mut lo = idx;
+    while lo > 0 && !chars[lo - 1].is_whitespace() {
+        lo -= 1;
+    }
+    let mut hi = idx + 1;
+    while hi < chars.len() && !chars[hi].is_whitespace() {
+        hi += 1;
+    }
+    let text: String = chars[lo..hi].iter().collect();
+    if text.is_empty() {
+        return None;
+    }
+    Some((text, vec![(row, lo as u16, hi as u16)]))
+}
+
 impl App {
     fn handle_api_request(&mut self, req: crate::ipc::api::ApiRequest) -> bool {
         if req.method == "terminal.backend.create" {
@@ -1346,6 +1380,33 @@ impl App {
                 if !m.modifiers.contains(KeyModifiers::SHIFT) && self.begin_mouse_forward(&m, 0) {
                     return;
                 }
+                // A second left press on (or within one cell of) the first,
+                // inside the double-click window, copies and highlights the
+                // path / URL / word under the cursor. This point is reached only
+                // when the press was *not* forwarded to a mouse-tracking app (its
+                // reporting is off, or `Shift` bypassed it), so it never steals a
+                // click a pane app wanted.
+                let now = Instant::now();
+                // Only a press inside a pane's content arms (and matches) the
+                // detector, and both presses must land in the *same* pane: a title
+                // or border click must never combine with a nearby body click into
+                // a double-click, which would copy and swallow the pane's focus.
+                let content_pane = self.pane_content_at(m.column, m.row).map(|(id, _)| id);
+                let is_double = self.last_left_click.take().is_some_and(|(pane, at, when)| {
+                    content_pane == Some(pane)
+                        && now.duration_since(when) <= DOUBLE_CLICK
+                        && m.column.abs_diff(at.0) <= 1
+                        && m.row.abs_diff(at.1) <= 1
+                });
+                if is_double {
+                    if self.copy_token_at(m.column, m.row) {
+                        // Its release keeps the highlight instead of re-copying.
+                        self.dbl_click_release = true;
+                        return;
+                    }
+                } else if let Some(pane) = content_pane {
+                    self.last_left_click = Some((pane, (m.column, m.row), now));
+                }
                 // Begin a selection only inside a pane's content; otherwise drop
                 // any old one. Falls through to normal click handling (focus/etc).
                 self.selection = self
@@ -1405,10 +1466,20 @@ impl App {
                     }
                     return;
                 }
+                // Dragging after a double-click turns it back into an ordinary
+                // selection, so its release copies what was dragged.
+                self.dbl_click_release = false;
                 self.update_mouse_selection_cursor(m.column, m.row);
                 return;
             }
             MouseEventKind::Up(MouseButton::Left) | MouseEventKind::Up(MouseButton::Middle) => {
+                // A double-click already copied and highlighted on its press; its
+                // release keeps that selection rather than re-copying it or
+                // clearing it the way a plain click would.
+                if self.dbl_click_release {
+                    self.dbl_click_release = false;
+                    return;
+                }
                 if let Some(p) = self.link_press.take() {
                     if (m.column, m.row) == p.at {
                         self.activate_link(p.target);
@@ -2393,6 +2464,69 @@ impl App {
         })
     }
 
+    /// Copy the path, URL, or word under screen cell (`col`, `row`) to the
+    /// clipboard and highlight it — the double-click gesture. A path or URL is
+    /// copied as its full raw token (`src/main.rs:42:7` verbatim, a soft-wrapped
+    /// path rejoined); anything else falls back to the whitespace-delimited word,
+    /// and a whitespace or empty cell copies nothing. Returns whether it copied.
+    ///
+    /// Uses the pure [`crate::links::link_at`], not [`Self::link_at_screen`]:
+    /// copying doesn't need the file to exist, so a `pwd` directory or a
+    /// not-yet-created path still copies.
+    fn copy_token_at(&mut self, col: u16, row: u16) -> bool {
+        let Some((pane, content)) = self.pane_content_at(col, row) else {
+            return false;
+        };
+        let rows = {
+            let Some(p) = self.panes.get(&pane) else {
+                return false;
+            };
+            let Ok(engine) = p.engine.lock() else {
+                return false;
+            };
+            // Cell-aligned rows: a wide glyph before the token would otherwise
+            // shift `gcol` off the intended character (and its highlight).
+            engine.visible_rows_aligned()
+        };
+        let (gcol, grow) = (col - content.x, row - content.y);
+        let (text, spans) = match crate::links::link_at(&rows, gcol, grow) {
+            Some(link) => {
+                let text = match link.hit {
+                    crate::links::Hit::Url(u) => u,
+                    crate::links::Hit::Path { raw, .. } => raw,
+                };
+                (text, link.spans)
+            }
+            None => match word_at_grid(&rows, gcol, grow) {
+                Some(pair) => pair,
+                None => return false,
+            },
+        };
+        if text.is_empty() {
+            return false;
+        }
+        // Highlight exactly the copied cells: from the first covered cell to the
+        // last, which for a rejoined soft-wrapped path runs through the full rows
+        // between them (the same reading-order rule `Selection` copies with). The
+        // highlight is transient (screen coordinates, cleared on the next click),
+        // so it carries no retained-history span.
+        if let (Some(first), Some(last)) = (spans.first(), spans.last()) {
+            self.selection = Some(Selection {
+                pane,
+                content,
+                anchor: (content.x + first.1, content.y + first.0),
+                cursor: (content.x + last.2.saturating_sub(1), content.y + last.0),
+                retained: None,
+                scrolled: false,
+                dragging: false,
+            });
+        }
+        self.pending_clipboard = Some(text);
+        let msg = self.catalog.copied;
+        self.show_toast(msg);
+        true
+    }
+
     /// Show a transient toast (e.g. "Copied") bottom-center for ~1.4s.
     /// Open the "what's running here?" overlay for `id`, snapshotting the pane's
     /// process tree from the OS. Shelling out to `ps` is why this happens on the
@@ -2442,7 +2576,9 @@ impl App {
         let (pane, content) = self.pane_content_at(col, row)?;
         let rows = {
             let engine = self.panes.get(&pane)?.engine.lock().ok()?;
-            engine.visible_rows()
+            // Cell-aligned rows so a wide glyph before the link doesn't shift the
+            // column the underline lands on (or which cells Ctrl-click opens).
+            engine.visible_rows_aligned()
         };
         let link = crate::links::link_at(&rows, col - content.x, row - content.y)?;
         let target = match &link.hit {
@@ -4232,6 +4368,32 @@ mod link_click_tests {
         assert_eq!(app.pending_open_url.as_deref(), Some(URL));
     }
 
+    /// The double-click fallback: the whitespace-delimited word under a cell,
+    /// with the single span it covers. Used when a cell isn't a path or URL.
+    #[test]
+    fn word_at_grid_takes_the_whitespace_word_under_the_cell() {
+        let rows = vec!["  foo(bar) baz  ".to_string()];
+        // Anywhere inside the token grabs the whole whitespace-delimited run,
+        // punctuation included, and reports its exact span.
+        for col in 2..=9 {
+            assert_eq!(
+                word_at_grid(&rows, col, 0),
+                Some(("foo(bar)".to_string(), vec![(0, 2, 10)])),
+                "col {col}"
+            );
+        }
+        // A neighbouring word is its own token.
+        assert_eq!(
+            word_at_grid(&rows, 11, 0),
+            Some(("baz".to_string(), vec![(0, 11, 14)]))
+        );
+        // Whitespace and out-of-range cells copy nothing.
+        assert_eq!(word_at_grid(&rows, 1, 0), None, "leading blank");
+        assert_eq!(word_at_grid(&rows, 10, 0), None, "gap between words");
+        assert_eq!(word_at_grid(&rows, 99, 0), None, "past the line");
+        assert_eq!(word_at_grid(&rows, 0, 5), None, "past the last row");
+    }
+
     #[test]
     fn mouse_copy_drops_a_uniform_one_cell_pane_margin() {
         assert_eq!(
@@ -4389,6 +4551,181 @@ mod link_click_tests {
         });
 
         assert_eq!(app.selection_text().as_deref(), Some("你好"));
+    }
+
+    /// A title-strip click must never arm the double-click detector. Otherwise a
+    /// following body click one row down is read as a double-click, copies the
+    /// token under it, and `return`s before the focus cascade — the exact shape
+    /// that failed Linux CI in `stacked_bottom_pane_title_zoom_and_body_are_all_clickable`.
+    /// Here it is pinned deterministically by putting a token under the body cell,
+    /// so a regressed detector copies on every platform instead of only where the
+    /// body cell happens to be non-empty.
+    #[test]
+    fn a_title_click_then_a_body_click_focuses_the_pane_not_a_double_click() {
+        let _env = crate::persist::test_env("title-then-body-focus");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let top = app.layout().focus;
+        app.run_cmd(crate::app::keys::Cmd::SplitDown);
+        let bottom = app.layout().focus;
+        assert_ne!(top, bottom);
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        // A token under the bottom pane's body: a false double-click would copy it.
+        app.panes
+            .get(&bottom)
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[H\x1b[2Jhello");
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let (_, title) = *app
+            .pane_title_rects
+            .iter()
+            .max_by_key(|(_, r)| r.y)
+            .expect("bottom pane has a title strip");
+        let body = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == bottom)
+            .map(|(_, r)| *r)
+            .expect("bottom pane has a content rect");
+        // Same column, and the body sits one row under the title, so a detector
+        // that armed on the title would read the body click as a double-click.
+        let col = body.x + 1;
+        assert!(
+            body.y.abs_diff(title.y) <= 1,
+            "body is adjacent to the title"
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (col, title.y),
+            KeyModifiers::NONE,
+        ));
+        assert!(
+            app.cmd_inspect.is_some(),
+            "the title click opened the command overlay (setup sanity)"
+        );
+        app.close_cmd_inspect();
+        // Reset focus *after* the title click, so only the body click can move it.
+        app.layout_mut().focus = top;
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            (col, body.y),
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(
+            app.layout().focus,
+            bottom,
+            "the body click focused the pane instead of being a double-click"
+        );
+        assert!(
+            app.pending_clipboard.is_none(),
+            "the body click did not copy — it was not a double-click"
+        );
+    }
+
+    /// A real timed double-click (press, release, press) copies the word under the
+    /// cursor; a lone press first copies nothing.
+    #[test]
+    fn a_double_click_copies_the_word_under_the_cursor() {
+        let _env = crate::persist::test_env("double-click-copy");
+        // Click the second word, well clear of the sidebar-resize divider at the
+        // pane's left edge (a press there grabs the divider, not the grid).
+        let (mut app, _t, at) = fixture_showing("hello world", 6);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert!(
+            app.pending_clipboard.is_none(),
+            "one press and release copies nothing"
+        );
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.pending_clipboard.as_deref(),
+            Some("world"),
+            "the second press copies the whitespace word"
+        );
+        assert!(app.selection.is_some(), "and highlights it");
+    }
+
+    /// The wide-character case for copying: a CJK glyph before a token shifts every
+    /// following terminal column by its spacer cell, so both the copied text and
+    /// the highlight must be addressed by cell column, not string index.
+    #[test]
+    fn a_double_click_copies_a_token_after_wide_characters() {
+        let _env = crate::persist::test_env("double-click-copy-wide");
+        // 你(cols 0-1) 好(cols 2-3) space(col 4), then src/main.rs at cols 5..16.
+        let (mut app, _t, at) = fixture_showing("你好 src/main.rs", 5);
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            at,
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(
+            app.pending_clipboard.as_deref(),
+            Some("src/main.rs"),
+            "the whole path copies, not a wide-char-shifted fragment"
+        );
+        let sel = app.selection.expect("the copied path is highlighted");
+        assert_eq!(
+            (sel.anchor, sel.cursor),
+            ((at.0, at.1), (at.0 + 10, at.1)),
+            "the highlight covers the path's true cells (cols 5..16)"
+        );
+    }
+
+    /// The wide-character case for Ctrl-hover/Ctrl-click link resolution, which
+    /// shares the same `visible_rows` indexing: a CJK glyph before a path must not
+    /// shift where the underline lands or which cells open.
+    #[test]
+    fn ctrl_hover_after_wide_characters_underlines_the_real_cells() {
+        let _env = crate::persist::test_env("ctrl-hover-wide");
+        // 你好 then a real on-disk path: Cargo.toml occupies grid cols 5..15.
+        let (app, _t, at) = fixture_showing("你好 Cargo.toml", 5);
+
+        let h = app
+            .link_at_screen(at.0, at.1)
+            .expect("the path after the CJK glyphs resolves");
+        assert!(
+            matches!(&h.target, LinkTarget::File { .. }),
+            "got {:?}",
+            h.target
+        );
+        assert!(
+            h.link.covers(5, 0),
+            "underline starts at the path's true column"
+        );
+        assert!(h.link.covers(14, 0), "and reaches its end");
+        assert!(!h.link.covers(4, 0), "not the space before it");
     }
 
     #[test]
