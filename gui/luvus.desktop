@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Luvus
+Comment=Mission control for your AI coding agents
+Exec=luvus-gui
+Icon=luvus
+Terminal=false
+Type=Application
+Categories=Development;IDE;
+Keywords=terminal;multiplexer;ai;agents;coding;
+StartupWMClass=luvus
+MimeType=

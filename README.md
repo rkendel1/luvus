@@ -43,6 +43,10 @@
   history, use copy mode, click detected links, and run full-screen terminal apps.
 - **Extensible surfaces:** Install modules with actions, events, settings,
   startup hooks, panes, sidebar docks, and Top or Bottom Luvus Bar widgets.
+- **State graph:** Every workspace, pane, and agent mutation is recorded as a
+  typed operation. Agents can query full operation history for context.
+- **Native desktop GUI:** Build with `--features gui` for a GPU-accelerated
+  native window (Phase 3+, currently in development).
 - **Universal Harness Protocol:** Build harnesses and orchestrators on the
   single versioned UHP 1.0 method registry, with owner-only local IPC,
   snapshots, event streams, exact input, and semantic waits.
@@ -105,6 +109,18 @@ the complete CLI and API reference.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests, and pull request
 requirements. Report vulnerabilities through [SECURITY.md](SECURITY.md).
+
+### Building the GUI
+
+The native desktop GUI is behind a feature flag. To build it:
+
+```bash
+cargo build --release --features gui
+# Produces: target/release/luvus-gui
+```
+
+Note: The GUI is currently in Phase 1 (stub implementation). Full feature parity
+with the TUI is planned for Phase 3.
 
 ## License
 

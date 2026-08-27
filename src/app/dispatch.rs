@@ -618,6 +618,8 @@ impl App {
         // the state remains Idle. Keep this separate from `agent_appeared`:
         // non-resumable agents still need a repaint, but not a persisted session.
         let mut visible_identity_changed = false;
+        // Agent detections collected for state_db recording after borrow ends.
+        let mut agent_detections: Vec<(PaneId, String, String)> = Vec::new();
         // OSC title changes can alter tab labels even when their pane is not in
         // the active tab. Hidden PTY bytes do not schedule presentation, so the
         // detector must explicitly surface this metadata-only invalidation.
@@ -814,10 +816,28 @@ impl App {
                 let was_visible_agent = self.manifests.is_agent(&s.agent)
                     || s.agent_session.is_some()
                     || s.agent_report.is_some();
+                let old_agent = s.agent.clone();
                 let agent_changed = s.agent != detected;
                 let is_visible_agent = self.manifests.is_agent(&detected)
                     || s.agent_session.is_some()
                     || s.agent_report.is_some();
+                // Track if this is a new agent detection for later recording
+                let agent_detected_event = if agent_changed
+                    && old_agent.is_empty()
+                    && !detected.is_empty()
+                {
+                    let session_id = s
+                        .agent_session
+                        .as_ref()
+                        .map(|sess| sess.session_id.clone())
+                        .unwrap_or_default();
+                    Some((id, detected.clone(), session_id))
+                } else {
+                    None
+                };
+                if let Some((pane_id, agent_name, sess_id)) = agent_detected_event {
+                    agent_detections.push((pane_id, agent_name, sess_id));
+                }
                 s.agent = detected;
                 if agent_changed {
                     log_agent_identity(id, &s.agent, s.identity_source);
@@ -871,6 +891,17 @@ impl App {
         if agent_appeared {
             self.session_dirty = true;
         }
+        // Record agent detections after the mutable borrow ends.
+        for (pane_id, agent_name, session_id) in agent_detections {
+            self.record_mutation(crate::state_db::StateOp::new(
+                pane_id.0.to_string(),
+                crate::state_db::EntityType::Agent,
+                crate::state_db::OpType::AgentDetected {
+                    name: agent_name,
+                    session_id,
+                },
+            ));
+        }
         // A state transition needs presentation only when that state has a
         // rendered consumer: a visible pane, a live AGENTS/Mission row, or an
         // orchestration board. Quiet shells in inactive tabs still publish API
@@ -909,6 +940,20 @@ impl App {
                 .workspace_of_pane(id)
                 .map(|ws| (ws.name.clone(), ws.branch.clone()))
                 .unwrap_or_default();
+            // Record state operation for agent status change
+            let old_state = self
+                .status
+                .get(&id)
+                .map(|s| state_str(s.state))
+                .unwrap_or("unknown");
+            self.record_mutation(crate::state_db::StateOp::new(
+                id.0.to_string(),
+                crate::state_db::EntityType::Agent,
+                crate::state_db::OpType::AgentStatusChanged {
+                    old: old_state.to_string(),
+                    new: state_str(st).to_string(),
+                },
+            ));
             self.emit_event(
                 "pane.agent_status_changed",
                 json!({
@@ -1451,6 +1496,52 @@ impl App {
                 reject_api_fields(p, &["workspace", "workspace_id"])?;
                 let index = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
                 self.socket_workspace(index)
+            }
+            // Get agent context for a workspace: current state + recent operation history.
+            // This gives agents full context about what has happened, not just a snapshot.
+            "workspace.context" => {
+                reject_api_fields(p, &["workspace", "workspace_id"])?;
+                let index = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+                let workspace = self
+                    .workspaces
+                    .get(index)
+                    .ok_or_else(not_found)?;
+                let context = self.workspace_context(&workspace.id);
+                match context {
+                    Some(ctx) => {
+                        Ok(json!({
+                            "type": "workspace_context",
+                            "workspace": index.to_string(),
+                            "workspace_id": workspace.id,
+                            "summary": ctx.summary(),
+                            "stats": {
+                                "active_panes": ctx.stats.active_panes,
+                                "active_agents": ctx.stats.active_agents,
+                                "recent_op_count": ctx.stats.recent_op_count,
+                                "total_tokens": ctx.stats.total_tokens,
+                                "total_cost": ctx.stats.total_cost,
+                            },
+                            "current_state": ctx.current_state,
+                            "recent_changes": ctx.recent_changes,
+                            "active_agents": ctx.active_agents(),
+                            "completed_tasks": ctx.completed_tasks().len(),
+                        }))
+                    }
+                    None => {
+                        // State database not initialized
+                        Ok(json!({
+                            "type": "workspace_context",
+                            "workspace": index.to_string(),
+                            "workspace_id": workspace.id,
+                            "summary": "state database not initialized",
+                            "stats": null,
+                            "current_state": [],
+                            "recent_changes": [],
+                            "active_agents": [],
+                            "completed_tasks": 0,
+                        }))
+                    }
+                }
             }
             "workspace.move" => {
                 reject_api_fields(p, &["workspace", "workspace_id", "to"])?;
@@ -2024,6 +2115,14 @@ impl App {
                 }
                 self.set_agent_name(pane, (!name.is_empty()).then_some(name));
                 self.emit_event("pane.renamed", json!({"pane":pane.0.to_string(),"name":if name.is_empty(){Value::Null}else{json!(name)}}));
+                // Record state operation for pane rename
+                self.record_mutation(crate::state_db::StateOp::new(
+                    pane.0.to_string(),
+                    crate::state_db::EntityType::Pane,
+                    crate::state_db::OpType::PaneNameSet {
+                        name: name.to_string(),
+                    },
+                ));
                 Ok(
                     json!({"type":"pane_rename","pane":pane.0.to_string(),"name":if name.is_empty(){Value::Null}else{json!(name)}}),
                 )
@@ -2459,6 +2558,15 @@ impl App {
                         "pane.agent_status_changed",
                         json!({"pane":id.0.to_string(), "status":state_str(state), "agent":agent, "cwd":cwd, "project":project, "branch":branch, "authority":"integration_report"}),
                     );
+                    // Record state operation for agent status change
+                    self.record_mutation(crate::state_db::StateOp::new(
+                        id.0.to_string(),
+                        crate::state_db::EntityType::Agent,
+                        crate::state_db::OpType::AgentStatusChanged {
+                            old: "unknown".to_string(),
+                            new: state_str(state).to_string(),
+                        },
+                    ));
                 }
                 self.check_agent_waits(id);
                 Ok(json!({
@@ -2523,6 +2631,14 @@ impl App {
                 let idx = self.resumable.iter().position(|s| s.session_id == sid);
                 match idx {
                     Some(i) => {
+                        // Record session resume before spawning
+                        self.record_mutation(crate::state_db::StateOp::new(
+                            sid.to_string(),
+                            crate::state_db::EntityType::Agent,
+                            crate::state_db::OpType::AgentSessionResumed {
+                                session_id: sid.to_string(),
+                            },
+                        ));
                         self.resume_session(i);
                         Ok(json!({"type":"ok"}))
                     }
@@ -3640,7 +3756,7 @@ impl App {
                 let task = self
                     .orch
                     .add_task(
-                        title,
+                        title.clone(),
                         str_array(p, "paths"),
                         str_array(p, "deps"),
                         opt_str(p, "gate"),
@@ -3648,6 +3764,15 @@ impl App {
                     .map_err(orch_err)?;
                 self.orch.save();
                 self.emit_event("task.added", task_json(&task));
+                // Record state operation for task creation
+                self.record_mutation(crate::state_db::StateOp::new(
+                    task.id.clone(),
+                    crate::state_db::EntityType::Task,
+                    crate::state_db::OpType::TaskCreated {
+                        task_id: task.id.clone(),
+                        title,
+                    },
+                ));
                 Ok(json!({ "type": "task", "task": task_json(&task) }))
             }
             "task.list" => Ok(json!({
@@ -3689,6 +3814,15 @@ impl App {
                         ("bad_request".to_string(), format!("unknown status: {s}"))
                     })?;
                     self.orch.set_status(&id, st).map_err(orch_err)?;
+                    // Record state operation for task update
+                    self.record_mutation(crate::state_db::StateOp::new(
+                        id.clone(),
+                        crate::state_db::EntityType::Task,
+                        crate::state_db::OpType::TaskUpdated {
+                            task_id: id.clone(),
+                            status: s.to_string(),
+                        },
+                    ));
                 }
                 if let Some(o) = p.get("output").and_then(|v| v.as_str()) {
                     self.orch.add_output(&id, o.to_string()).map_err(orch_err)?;
