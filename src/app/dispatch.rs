@@ -618,6 +618,8 @@ impl App {
         // the state remains Idle. Keep this separate from `agent_appeared`:
         // non-resumable agents still need a repaint, but not a persisted session.
         let mut visible_identity_changed = false;
+        // Agent detections collected for state_db recording after borrow ends.
+        let mut agent_detections: Vec<(PaneId, String, String)> = Vec::new();
         // OSC title changes can alter tab labels even when their pane is not in
         // the active tab. Hidden PTY bytes do not schedule presentation, so the
         // detector must explicitly surface this metadata-only invalidation.
@@ -814,10 +816,28 @@ impl App {
                 let was_visible_agent = self.manifests.is_agent(&s.agent)
                     || s.agent_session.is_some()
                     || s.agent_report.is_some();
+                let old_agent = s.agent.clone();
                 let agent_changed = s.agent != detected;
                 let is_visible_agent = self.manifests.is_agent(&detected)
                     || s.agent_session.is_some()
                     || s.agent_report.is_some();
+                // Track if this is a new agent detection for later recording
+                let agent_detected_event = if agent_changed
+                    && old_agent.is_empty()
+                    && !detected.is_empty()
+                {
+                    let session_id = s
+                        .agent_session
+                        .as_ref()
+                        .map(|sess| sess.session_id.clone())
+                        .unwrap_or_default();
+                    Some((id, detected.clone(), session_id))
+                } else {
+                    None
+                };
+                if let Some((pane_id, agent_name, sess_id)) = agent_detected_event {
+                    agent_detections.push((pane_id, agent_name, sess_id));
+                }
                 s.agent = detected;
                 if agent_changed {
                     log_agent_identity(id, &s.agent, s.identity_source);
@@ -870,6 +890,17 @@ impl App {
         }
         if agent_appeared {
             self.session_dirty = true;
+        }
+        // Record agent detections after the mutable borrow ends.
+        for (pane_id, agent_name, session_id) in agent_detections {
+            self.record_mutation(crate::state_db::StateOp::new(
+                pane_id.0.to_string(),
+                crate::state_db::EntityType::Agent,
+                crate::state_db::OpType::AgentDetected {
+                    name: agent_name,
+                    session_id,
+                },
+            ));
         }
         // A state transition needs presentation only when that state has a
         // rendered consumer: a visible pane, a live AGENTS/Mission row, or an
@@ -2600,6 +2631,14 @@ impl App {
                 let idx = self.resumable.iter().position(|s| s.session_id == sid);
                 match idx {
                     Some(i) => {
+                        // Record session resume before spawning
+                        self.record_mutation(crate::state_db::StateOp::new(
+                            sid.to_string(),
+                            crate::state_db::EntityType::Agent,
+                            crate::state_db::OpType::AgentSessionResumed {
+                                session_id: sid.to_string(),
+                            },
+                        ));
                         self.resume_session(i);
                         Ok(json!({"type":"ok"}))
                     }

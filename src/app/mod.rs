@@ -4732,8 +4732,30 @@ impl App {
         {
             return Err(TabFocusError::PositionOutOfRange);
         }
+        let ws_changed = self.active_ws != workspace;
+        let tab_changed = self.workspaces[workspace].active_tab != index;
         self.active_ws = workspace;
         self.workspaces[workspace].active_tab = index;
+
+        // Record workspace focus change
+        if ws_changed {
+            let ws_id = self.workspaces[workspace].id.clone();
+            self.record_mutation(crate::state_db::StateOp::new(
+                ws_id,
+                crate::state_db::EntityType::Workspace,
+                crate::state_db::OpType::WorkspaceFocused,
+            ));
+        }
+
+        // Record tab focus change
+        if tab_changed {
+            let tab_id = format!("{}:{}", workspace, index);
+            self.record_mutation(crate::state_db::StateOp::new(
+                tab_id,
+                crate::state_db::EntityType::Tab,
+                crate::state_db::OpType::TabFocused,
+            ));
+        }
         Ok(())
     }
 
@@ -4997,6 +5019,12 @@ impl App {
             self.workspaces[wi].tabs[ti].layout.focus = id;
             if changed {
                 self.scroll_pane = None;
+                // Record pane focus change
+                self.record_mutation(crate::state_db::StateOp::new(
+                    id.0.to_string(),
+                    crate::state_db::EntityType::Pane,
+                    crate::state_db::OpType::PaneFocused,
+                ));
             }
             self.mode = Mode::Normal;
         }
