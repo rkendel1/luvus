@@ -134,6 +134,22 @@ static SOURCES: &[SessionSource] = &[
         fork: Some(|q| format!("pi --fork {q}\r")),
     },
     SessionSource {
+        // Oh My Pi (omp) — pi's end-user packaging. Sessions share pi's file
+        // layout (header line carries `id` + `cwd`) and `PI_CODING_AGENT_SESSION_DIR`
+        // override. omp resumes with `--resume` (not `--session` like pi) and
+        // forks with `--fork <session>` — both accept an id prefix or a path.
+        // Hook-reported ids arrive via pane.report_session.
+        name: "omp",
+        discover: Some(Discovery {
+            base: omp_base,
+            recent: omp_recent,
+            latest: pi_latest,
+            list: Some(pi_list),
+        }),
+        resume: |q| format!("omp --resume {q}\r"),
+        fork: Some(|q| format!("omp --fork {q}\r")),
+    },
+    SessionSource {
         name: "gemini",
         discover: Some(Discovery {
             base: gemini_base,
@@ -1187,6 +1203,38 @@ fn pi_recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
     out
 }
 
+/// Oh My Pi (omp) sessions. omp ships pi's session layout unchanged — the
+/// first line is a self-describing header with `id` + `cwd`. omp's data root
+/// is `~/.omp/agent/sessions`; `PI_CODING_AGENT_SESSION_DIR` (also read by
+/// omp) overrides it.
+fn omp_base() -> PathBuf {
+    if let Some(d) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
+        return PathBuf::from(d);
+    }
+    home().join(".omp").join("agent").join("sessions")
+}
+
+/// omp shares pi's session format, so discovery delegates to the pi
+/// implementations (`pi_latest`/`pi_list` above) — a fix in one place keeps
+/// both agents correct. Only `omp_recent` exists to relabel results.
+/// Test-visible alias: omp's `latest` discovery is pi's verbatim (wired
+/// directly as `Discovery.latest = pi_latest`), but tests target omp by name.
+#[cfg_attr(not(test), allow(dead_code))]
+fn omp_latest(base: &Path, cwd: &Path) -> Option<String> {
+    pi_latest(base, cwd)
+}
+
+fn omp_recent(base: &Path, limit: usize) -> Vec<SessionInfo> {
+    // Same scan as `pi_recent`; only the reported agent label differs.
+    pi_recent(base, limit)
+        .into_iter()
+        .map(|mut s| {
+            s.agent = "omp".to_string();
+            s
+        })
+        .collect()
+}
+
 // ── Gemini CLI and Qwen Code ────────────────────────────────────────────────
 // Both keep project-scoped JSONL chats under `<base>/tmp/<project>/chats/` and
 // write the original project path to the sibling `.project_root` file. The
@@ -1927,6 +1975,64 @@ mod tests {
                 .unwrap()
                 .session_id,
             "cccc"
+        );
+    }
+
+    #[test]
+    fn omp_discovers_pi_layout_sessions_and_resumes_with_omp_flag() {
+        // omp ships pi's session layout: <base>/<encoded-cwd>/<uuid>.jsonl with
+        // a self-describing header. Discovery matches by cwd; the resume command
+        // uses `omp --resume` (not pi's `--session`), and omp forks a saved
+        // session with `--fork <session>` (id prefix or path), like pi.
+        let base = tmp("omp");
+        let app = base.join("-work-app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("dddd.jsonl"),
+            "{\"type\":\"session\",\"id\":\"dddd\",\"cwd\":\"/work/app\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            omp_latest(&base, Path::new("/work/app")).as_deref(),
+            Some("dddd")
+        );
+        let recent = omp_recent(&base, 10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].agent, "omp");
+        assert_eq!(recent[0].session_id, "dddd");
+
+        let cmd = resume_command("omp", "dddd").unwrap();
+        assert!(cmd.contains("omp --resume"), "uses omp's flag: {cmd}");
+        assert!(!cmd.contains("--session"), "pi's flag must not leak");
+        assert!(is_resumable("omp"));
+        assert!(can_fork("omp"), "omp forks saved sessions with --fork");
+        let fork = fork_command("omp", "dddd").unwrap();
+        assert!(fork.contains("omp --fork"), "uses omp's flag: {fork}");
+    }
+
+    #[test]
+    fn omp_reads_sessions_with_a_title_slot_before_the_header() {
+        // Current omp builds prepend a fixed-width 256-byte `type:"title"`
+        // slot line before the session header. The parser must skip it (no
+        // id/cwd keys) and still find the header within the 5-line scan.
+        let base = tmp("omp-title-slot");
+        let app = base.join("-work-app");
+        fs::create_dir_all(&app).unwrap();
+        let title_slot = format!(
+            "{:<255}\n",
+            "{\"type\":\"title\",\"v\":1,\"title\":\"x\",\"pad\":\"\"}"
+        );
+        assert_eq!(title_slot.len(), 256, "the physical slot is 256 bytes");
+        fs::write(
+            app.join("eeee.jsonl"),
+            format!("{title_slot}{{\"type\":\"session\",\"id\":\"eeee\",\"cwd\":\"/work/app\"}}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            omp_latest(&base, Path::new("/work/app")).as_deref(),
+            Some("eeee")
         );
     }
 
