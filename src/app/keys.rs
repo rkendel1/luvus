@@ -703,9 +703,11 @@ impl App {
             Cmd::NextWorkspace => self.cycle_workspace(1),
             Cmd::PrevWorkspace => self.cycle_workspace(-1),
             Cmd::JumpWorkspace(position) => {
-                if let Some(&(workspace, _)) = self
-                    .workspace_display_order()
-                    .get(position.saturating_sub(1) as usize)
+                let Some(index) = position.checked_sub(1).filter(|&index| index < 9) else {
+                    return;
+                };
+                if let Some(&(workspace, _)) =
+                    self.workspace_display_order().get(usize::from(index))
                 {
                     self.active_ws = workspace;
                 }
@@ -845,6 +847,10 @@ mod tests {
 
         app.run_cmd(Cmd::JumpWorkspace(9));
         assert_eq!(app.active_ws, 2, "an unavailable position is a no-op");
+        app.run_cmd(Cmd::JumpWorkspace(0));
+        assert_eq!(app.active_ws, 2, "position zero is a no-op");
+        app.run_cmd(Cmd::JumpWorkspace(10));
+        assert_eq!(app.active_ws, 2, "an unsupported position is a no-op");
     }
 
     #[test]
