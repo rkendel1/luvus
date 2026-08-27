@@ -589,20 +589,30 @@ impl App {
                 }
                 true
             }
-            AppEvent::FileChanges { id, changes } => {
-                if let Some(crate::app::ViewKind::File(v)) = self.views.get_mut(&id) {
-                    v.changes = changes;
-                    true
-                } else {
-                    false // the view leaf closed before the diff landed
+            AppEvent::FileChanges { id, path, changes } => {
+                match self.views.get_mut(&id) {
+                    // A preview leaf may have been repointed at another file
+                    // while this ran; markers for the old one would tint the
+                    // wrong lines.
+                    Some(crate::app::ViewKind::File(v)) if v.path == path => {
+                        v.changes = changes;
+                        true
+                    }
+                    // The leaf closed, became a diff, or moved on: drop it.
+                    _ => false,
                 }
             }
-            AppEvent::FileRead { id, load } => {
-                if let Some(crate::app::ViewKind::File(v)) = self.views.get_mut(&id) {
-                    v.apply(load);
-                    true
-                } else {
-                    false // the view leaf was closed before its read landed
+            AppEvent::FileRead { id, path, load } => {
+                match self.views.get_mut(&id) {
+                    // Only apply a read the leaf is still waiting for. Browsing
+                    // A → B in one preview can finish A's read last, and the
+                    // header would then name B over A's text.
+                    Some(crate::app::ViewKind::File(v)) if v.path == path => {
+                        v.apply(load);
+                        true
+                    }
+                    // The leaf closed, became a diff, or moved on: drop it.
+                    _ => false,
                 }
             }
             AppEvent::GitData { view, payload } => {
@@ -1797,14 +1807,15 @@ impl App {
             return;
         }
         // Clicking a FILES row expands/collapses a folder or opens a file (docs/38).
-        // A plain click opens the file in a full tab (the native default); Shift
-        // opens it in a pane split beside the focus.
+        // A plain click follows the `File click behavior` setting — reuse one
+        // preview (the default) or open a whole tab; Shift is the permanent
+        // read-only pane beside the focus, and never configurable.
         if let Some((i, _)) = self.file_tree_rects.iter().find(|(_, rect)| hit(*rect)) {
             let i = *i;
             let target = if m.modifiers.contains(KeyModifiers::SHIFT) {
                 crate::app::files::OpenTarget::Pane
             } else {
-                crate::app::files::OpenTarget::Tab
+                self.file_click_target()
             };
             self.file_row_activate(i, target);
             return;

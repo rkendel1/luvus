@@ -601,7 +601,11 @@ pub enum DiffMenuItem {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FileMenuItem {
-    /// Open in the native read-only viewer (files only).
+    /// Reuse the workspace's native read-only preview (files only). Offered
+    /// whatever `layout.file_click` is set to, so someone who clicks into tabs
+    /// can still take one quick look without adding a tab.
+    OpenPreview,
+    /// Open in the native read-only viewer, in its own tab (files only).
     OpenReadonly,
     /// Open with editor `editors[i]` (files only).
     OpenWith(usize),
@@ -619,6 +623,7 @@ impl FileMenu {
     pub fn build_items(&self) -> Vec<FileMenuItem> {
         let mut v = Vec::new();
         if !self.is_dir {
+            v.push(FileMenuItem::OpenPreview);
             v.push(FileMenuItem::OpenReadonly);
             v.extend((0..self.editors.len()).map(FileMenuItem::OpenWith));
             v.push(FileMenuItem::Divider);
@@ -1073,8 +1078,9 @@ impl PaneStatus {
 pub enum LinkTarget {
     /// Hand to the client's browser.
     Url(String),
-    /// Open in luvus's own viewer or editor, exactly like a FILES click (docs/38),
-    /// jumping to `line` when the reference carried one.
+    /// Open in luvus's own viewer or editor in a tab (docs/38), jumping to
+    /// `line` when the reference carried one. Always a tab: `File click
+    /// behavior` governs the FILES tree, not path activation.
     File { path: PathBuf, line: Option<u32> },
 }
 
@@ -2145,7 +2151,7 @@ impl App {
                         let p = path.clone();
                         std::thread::spawn(move || {
                             let load = crate::files::read_file(&p);
-                            let _ = tx.send(crate::event::AppEvent::FileRead { id, load });
+                            let _ = tx.send(crate::event::AppEvent::FileRead { id, path: p, load });
                         });
                         remap.insert(*raw, id);
                         continue;
