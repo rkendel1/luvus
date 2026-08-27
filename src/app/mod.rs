@@ -2621,8 +2621,6 @@ impl App {
     ///
     /// This is safe to call from any context — the operation is recorded
     /// asynchronously and does not block the caller.
-    /// Phase 1: not yet wired to all mutation points.
-    #[allow(dead_code)]
     pub fn record_mutation(&self, op: crate::state_db::StateOp) {
         if let Some(db) = &self.state_db {
             db.record_op(op);
@@ -2632,12 +2630,15 @@ impl App {
     /// Get agent context for a workspace from the state graph.
     ///
     /// Returns the current state snapshot plus recent operation history.
-    /// Phase 1: available but not yet exposed via UHP.
-    #[allow(dead_code)]
     pub fn workspace_context(&self, workspace_id: &str) -> Option<crate::state_db::AgentContext> {
         self.state_db
             .as_ref()
             .map(|db| db.agent_context(workspace_id))
+    }
+
+    /// Get state database statistics.
+    pub fn state_db_stats(&self) -> Option<crate::state_db::StateDbStats> {
+        self.state_db.as_ref().map(|db| db.stats())
     }
 
     /// Apply colors reported by the terminal displaying the foreground client.
@@ -3263,7 +3264,7 @@ impl App {
         let Some(cwd) = self.spawn_cwds().into_iter().next() else {
             return;
         };
-        if let Some(id) = self.spawn_into(cwd) {
+        if let Some(id) = self.spawn_into(cwd.clone()) {
             let ws = &mut self.workspaces[self.active_ws];
             ws.tabs.push(Tab::panes(TileLayout::new(id)));
             ws.active_tab = ws.tabs.len() - 1;
@@ -3276,6 +3277,24 @@ impl App {
                 ],
             );
             self.emit_event("tab.created", serde_json::json!({"tab": tab.to_string()}));
+            // Record state operation for tab creation
+            self.record_mutation(crate::state_db::StateOp::new(
+                format!("tab-{}-{}", self.active_ws, tab),
+                crate::state_db::EntityType::Tab,
+                crate::state_db::OpType::TabCreated {
+                    workspace_index: self.active_ws,
+                    cwd: cwd.display().to_string(),
+                },
+            ));
+            // Also record the pane creation
+            self.record_mutation(crate::state_db::StateOp::new(
+                id.0.to_string(),
+                crate::state_db::EntityType::Pane,
+                crate::state_db::OpType::PaneCreated {
+                    agent: None,
+                    cwd: cwd.display().to_string(),
+                },
+            ));
         }
     }
 
@@ -3304,8 +3323,19 @@ impl App {
             .get_mut(index)
             .ok_or(WorkspaceUpdateError::NotFound)?;
         if workspace.name != name {
+            let old_name = workspace.name.clone();
+            let workspace_id = workspace.id.clone();
             workspace.name = name.to_string();
             self.session_dirty = true;
+            // Record state operation for workspace rename
+            self.record_mutation(crate::state_db::StateOp::new(
+                workspace_id,
+                crate::state_db::EntityType::Workspace,
+                crate::state_db::OpType::WorkspaceRenamed {
+                    old: old_name,
+                    new: name.to_string(),
+                },
+            ));
         }
         Ok(())
     }
@@ -3322,8 +3352,17 @@ impl App {
             .get_mut(index)
             .ok_or(WorkspaceUpdateError::NotFound)?;
         if workspace.pinned != pinned {
+            let workspace_id = workspace.id.clone();
             workspace.pinned = pinned;
             self.session_dirty = true;
+            // Record state operation for workspace pin/unpin
+            if pinned {
+                self.record_mutation(crate::state_db::StateOp::new(
+                    workspace_id,
+                    crate::state_db::EntityType::Workspace,
+                    crate::state_db::OpType::WorkspacePinned,
+                ));
+            }
         }
         Ok(())
     }
@@ -3361,6 +3400,16 @@ impl App {
             "workspace.created",
             serde_json::json!({"workspace": ws.to_string()}),
         );
+        // Record state operation for workspace creation (get reference after emit_event)
+        let workspace = &self.workspaces[ws];
+        self.record_mutation(crate::state_db::StateOp::new(
+            workspace.id.clone(),
+            crate::state_db::EntityType::Workspace,
+            crate::state_db::OpType::WorkspaceCreated {
+                name: workspace.name.clone(),
+                cwd: workspace.cwd.display().to_string(),
+            },
+        ));
         crate::logging::event(
             crate::logging::EventKind::WorkspaceOpen,
             &[crate::logging::Field::WorkspaceIndex(ws as u64)],
@@ -5239,17 +5288,39 @@ impl App {
             self.close_active_tab();
         }
         self.emit_event("pane.closed", serde_json::json!({"pane": id.0.to_string()}));
+        // Record state operation for pane close
+        self.record_mutation(crate::state_db::StateOp::new(
+            id.0.to_string(),
+            crate::state_db::EntityType::Pane,
+            crate::state_db::OpType::PaneClosed { exit_code: None },
+        ));
     }
 
     fn close_active_tab(&mut self) {
         let workspace_index = self.active_ws;
-        let ws = &mut self.workspaces[self.active_ws];
-        let tab_index = ws.active_tab;
+        let tab_index;
         let mut removed = false;
-        if ws.active_tab < ws.tabs.len() {
-            ws.tabs.remove(ws.active_tab);
-            removed = true;
+        let tabs_empty;
+        let adjust_active_tab;
+
+        {
+            let ws = &mut self.workspaces[self.active_ws];
+            tab_index = ws.active_tab;
+            if ws.active_tab < ws.tabs.len() {
+                ws.tabs.remove(ws.active_tab);
+                removed = true;
+            }
+            tabs_empty = ws.tabs.is_empty();
+            adjust_active_tab = if !tabs_empty && ws.active_tab >= ws.tabs.len() {
+                Some(ws.tabs.len() - 1)
+            } else {
+                None
+            };
+            if let Some(new_active) = adjust_active_tab {
+                ws.active_tab = new_active;
+            }
         }
+
         if removed {
             crate::logging::event(
                 crate::logging::EventKind::TabClose,
@@ -5258,17 +5329,29 @@ impl App {
                     crate::logging::Field::TabIndex(tab_index as u64),
                 ],
             );
+            // Record state operation for tab close
+            self.record_mutation(crate::state_db::StateOp::new(
+                format!("tab-{}-{}", workspace_index, tab_index),
+                crate::state_db::EntityType::Tab,
+                crate::state_db::OpType::TabClosed {
+                    workspace_index,
+                    tab_index,
+                },
+            ));
         }
-        if ws.tabs.is_empty() {
+        if tabs_empty {
             self.close_active_ws();
-        } else if ws.active_tab >= ws.tabs.len() {
-            ws.active_tab = ws.tabs.len() - 1;
         }
     }
 
     fn close_active_ws(&mut self) {
         let workspace_index = self.active_ws;
         let mut removed = false;
+        let workspace_id = if self.active_ws < self.workspaces.len() {
+            self.workspaces[self.active_ws].id.clone()
+        } else {
+            String::new()
+        };
         if self.active_ws < self.workspaces.len() {
             let closed_workspace_id = self.workspaces[self.active_ws].id.clone();
             if self.workspaces.len() > 1 {
@@ -5293,6 +5376,12 @@ impl App {
                     workspace_index as u64,
                 )],
             );
+            // Record state operation for workspace close
+            self.record_mutation(crate::state_db::StateOp::new(
+                workspace_id,
+                crate::state_db::EntityType::Workspace,
+                crate::state_db::OpType::WorkspaceDeleted,
+            ));
         }
         if self.workspaces.is_empty() {
             self.all_workspaces_closed();

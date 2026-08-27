@@ -133,13 +133,17 @@ pub enum OpType {
 
     // ── Tab operations ──────────────────────────────────────────────────────
     TabCreated {
-        name: Option<String>,
+        workspace_index: usize,
+        cwd: String,
     },
     TabRenamed {
         old: Option<String>,
         new: Option<String>,
     },
-    TabClosed,
+    TabClosed {
+        workspace_index: usize,
+        tab_index: usize,
+    },
     TabFocused,
 
     // ── Task operations (orchestration) ─────────────────────────────────────

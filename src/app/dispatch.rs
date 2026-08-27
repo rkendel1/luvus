@@ -1452,6 +1452,52 @@ impl App {
                 let index = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
                 self.socket_workspace(index)
             }
+            // Get agent context for a workspace: current state + recent operation history.
+            // This gives agents full context about what has happened, not just a snapshot.
+            "workspace.context" => {
+                reject_api_fields(p, &["workspace", "workspace_id"])?;
+                let index = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+                let workspace = self
+                    .workspaces
+                    .get(index)
+                    .ok_or_else(not_found)?;
+                let context = self.workspace_context(&workspace.id);
+                match context {
+                    Some(ctx) => {
+                        Ok(json!({
+                            "type": "workspace_context",
+                            "workspace": index.to_string(),
+                            "workspace_id": workspace.id,
+                            "summary": ctx.summary(),
+                            "stats": {
+                                "active_panes": ctx.stats.active_panes,
+                                "active_agents": ctx.stats.active_agents,
+                                "recent_op_count": ctx.stats.recent_op_count,
+                                "total_tokens": ctx.stats.total_tokens,
+                                "total_cost": ctx.stats.total_cost,
+                            },
+                            "current_state": ctx.current_state,
+                            "recent_changes": ctx.recent_changes,
+                            "active_agents": ctx.active_agents(),
+                            "completed_tasks": ctx.completed_tasks().len(),
+                        }))
+                    }
+                    None => {
+                        // State database not initialized
+                        Ok(json!({
+                            "type": "workspace_context",
+                            "workspace": index.to_string(),
+                            "workspace_id": workspace.id,
+                            "summary": "state database not initialized",
+                            "stats": null,
+                            "current_state": [],
+                            "recent_changes": [],
+                            "active_agents": [],
+                            "completed_tasks": 0,
+                        }))
+                    }
+                }
+            }
             "workspace.move" => {
                 reject_api_fields(p, &["workspace", "workspace_id", "to"])?;
                 let workspace = self.required_socket_workspace(p)?;
@@ -2459,6 +2505,15 @@ impl App {
                         "pane.agent_status_changed",
                         json!({"pane":id.0.to_string(), "status":state_str(state), "agent":agent, "cwd":cwd, "project":project, "branch":branch, "authority":"integration_report"}),
                     );
+                    // Record state operation for agent status change
+                    self.record_mutation(crate::state_db::StateOp::new(
+                        id.0.to_string(),
+                        crate::state_db::EntityType::Agent,
+                        crate::state_db::OpType::AgentStatusChanged {
+                            old: "unknown".to_string(),
+                            new: state_str(state).to_string(),
+                        },
+                    ));
                 }
                 self.check_agent_waits(id);
                 Ok(json!({
