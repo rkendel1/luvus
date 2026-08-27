@@ -66,6 +66,29 @@ same as tmux's rename-window), and Settings lives on `=`. The **Menu** button
 scope chips (or `Tab`) to narrow it to one category. Arrows move, `Enter` jumps,
 `Esc` clears the filter then closes.
 
+## Jump directly to a workspace
+
+Settings → Keys includes unbound **Jump to workspace 1** through **Jump to
+workspace 9** actions. The number follows the current WORKSPACES sidebar display
+order, including pinned workspaces and grouped worktrees. A position that is not
+currently available does nothing.
+
+The stable configuration ids are `jump_workspace_1` through
+`jump_workspace_9`. For example:
+
+```json
+{
+  "keybindings": {
+    "jump_workspace_1": "!",
+    "jump_workspace_2": "@"
+  }
+}
+```
+
+These actions have no default keys. Shifted number keys vary across keyboard
+layouts and terminal implementations, so choose bindings that your terminal
+reports consistently.
+
 ## The global fuzzy finder
 
 `/` opens one finder across the selected Luvus home. It ranks named sessions,
